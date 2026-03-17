@@ -1,52 +1,169 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use bytes::BytesMut;
 use bytes::Buf;
 use nom::bytes::streaming::take;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use nom::{bytes::streaming::tag, sequence::preceded, IResult};
+use nom::IResult;
+use tokio::sync::Mutex;
+
+// Packet ID constants
+mod packet_ids {
+    pub const KEEP_ALIVE: u8 = 0x00;
+    pub const LOGIN_REQUEST: u8 = 0x01;
+    pub const HANDSHAKE: u8 = 0x02;
+    pub const SPAWN_POSITION: u8 = 0x06;
+    pub const PLAYER_POSITION: u8 = 0x0B;
+    pub const PLAYER_POSITION_AND_LOOK: u8 = 0x0D;
+    pub const PRE_CHUNK: u8 = 0x32;
+    pub const MAP_CHUNK: u8 = 0x33;
+}
+
+// Helper functions for parsing
+fn parse_i32(input: &[u8]) -> IResult<&[u8], i32> {
+    let (input, bytes) = take(4usize)(input)?;
+    Ok((input, i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])))
+}
+
+fn parse_i64(input: &[u8]) -> IResult<&[u8], i64> {
+    let (input, bytes) = take(8usize)(input)?;
+    Ok((input, i64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5], bytes[6], bytes[7],
+    ])))
+}
+
+fn parse_f32(input: &[u8]) -> IResult<&[u8], f32> {
+    let (input, bytes) = take(4usize)(input)?;
+    Ok((input, f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])))
+}
+
+fn parse_f64(input: &[u8]) -> IResult<&[u8], f64> {
+    let (input, bytes) = take(8usize)(input)?;
+    Ok((input, f64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5], bytes[6], bytes[7],
+    ])))
+}
+
+fn parse_utf16_string(input: &[u8]) -> IResult<&[u8], String> {
+    let (input, len) = take(2usize)(input)?;
+    let string_len = u16::from_be_bytes([len[0], len[1]]) as usize;
+    let (input, string_bytes) = take(string_len * 2)(input)?;
+    
+    let utf16_chars: Vec<u16> = string_bytes
+        .chunks(2)
+        .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+        .collect();
+    
+    Ok((input, String::from_utf16_lossy(&utf16_chars)))
+}
+
+fn parse_bool(input: &[u8]) -> IResult<&[u8], bool> {
+    let (input, byte) = take(1usize)(input)?;
+    Ok((input, byte[0] != 0))
+}
+
+// Helper functions for building packets
+fn write_utf16_string(buffer: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    buffer.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    for byte in bytes {
+        buffer.extend_from_slice(&[0x00, *byte]);
+    }
+}
+
+fn verify_zlib_format(data: &[u8]) -> bool {
+    if data.len() < 6 {
+        return false; // Too small for valid zlib (2 byte header + data + 4 byte checksum)
+    }
+    
+    // Check zlib header magic bytes
+    // 0x78 = deflate compression method
+    // Second byte varies based on compression level and window size
+    let valid_header = data[0] == 0x78 && (data[1] == 0x01 || data[1] == 0x9C || data[1] == 0xDA);
+    
+    if !valid_header {
+        eprintln!("WARNING: Invalid zlib header: {:02X} {:02X}", data[0], data[1]);
+        eprintln!("  Expected 0x78 followed by 0x01/0x9C/0xDA");
+    }
+    
+    valid_header
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:25565").await?;
-    println!("Server draait op 127.0.0.1:25565");
+    println!("Server listening on 127.0.0.1:25565");
 
     loop {
-        let (mut socket, _) = listener.accept().await?;
+        let (socket, addr) = listener.accept().await?;
+        println!("New connection from: {}", addr);
 
         tokio::spawn(async move {
-            handle_connection(socket).await;
+            if let Err(e) = handle_connection(socket).await {
+                eprintln!("Connection error: {}", e);
+            }
         });
     }
 }
 
-async fn handle_connection(mut socket: TcpStream) {
+async fn handle_connection(socket: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+    socket.set_nodelay(true)?; // Disable Nagle's algorithm for lower latency
+
     let mut buffer = BytesMut::with_capacity(1024);
     let mut read_buf = [0u8; 1024];
 
+    let socket = Arc::new(Mutex::new(socket)); // Wrap socket in Arc<Mutex> for shared access
+
+    let keepalive_socket = Arc::clone(&socket);
+    let keep_alive_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let mut sock = keepalive_socket.lock().await;
+            if let Err(e) = send_packet(&mut sock, ServerPacket::KeepAlive(0)).await {
+                eprintln!("Failed to send keep-alive: {}", e);
+                break; // Exit task on error (e.g. connection closed)
+            }
+        }
+    });
+
     loop {
-        let n = match socket.read(&mut read_buf).await {
-            Ok(0) => return, // Verbinding gesloten
-            Ok(n) => n,
-            Err(_) => return,
+        let n = {
+            let mut sock = socket.lock().await;
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                sock.read(&mut read_buf)
+            ).await??
         };
+
+        if n == 0 {
+            keep_alive_task.abort(); // Stop keep-alive task if connection is closed
+            return Ok(()); // Connection closed
+        }
 
         buffer.extend_from_slice(&read_buf[..n]);
 
         while !buffer.is_empty() {
-            match parse_message(&buffer) {
-                Ok((remaining, output)) => {
-                    println!("Geparsed: {:?}", output);
+            match parse_packet(&buffer) {
+                Ok((remaining, packet)) => {
+                    println!("Parsed packet: {:?}", packet);
                     
                     let consumed = buffer.len() - remaining.len();
                     buffer.advance(consumed); 
 
-                    handle_packet(output, &mut socket).await;
+                    let mut sock = socket.lock().await; // Lock socket for sending response
+                    handle_packet(packet, &mut sock).await?;
                 }
                 Err(nom::Err::Incomplete(_)) => {
+                    // Need more data
                     break;
                 }
-                Err(_) => {
-                    eprintln!("Parse fout, buffer legen, buffer: {:#04x?}", read_buf[..n].to_vec());
+                Err(e) => {
+                    eprintln!("Parse error: {:?}, clearing buffer", e);
                     buffer.clear();
                     break;
                 }
@@ -55,176 +172,80 @@ async fn handle_connection(mut socket: TcpStream) {
     }
 }
 
-// Example
-//   0x02, Packet ID
-//   0x00, 
-//   0x05,
-//   0x00,
-//   0x4d,
-//   0x00,
-//   0x72,
-//   0x00,
-//   0x6f,
-//   0x00,
-//   0x39,
-//   0x00,
-//   0x35,
-
-fn parse_message(input: &[u8]) -> IResult<&[u8], ClientServerPackets> {
-    // Parse the packet ID (1 byte)
+fn parse_packet(input: &[u8]) -> IResult<&[u8], ClientPacket> {
     let (input, packet_id) = take(1usize)(input)?;
+    
     match packet_id[0] {
-        // 0x00 is Keep Alive
-        0x00 => {
-            // parse the Keep Alive packet (4 bytes of random data)
-            let (input, keep_alive_data) = take(4usize)(input)?;
-            let keep_alive_value = i32::from_be_bytes([keep_alive_data[0], keep_alive_data[1], keep_alive_data[2], keep_alive_data[3]]);
-            Ok((input, ClientServerPackets::KeepAlive(keep_alive_value)))
+        packet_ids::KEEP_ALIVE => {
+            let (input, keep_alive_value) = parse_i32(input)?;
+            Ok((input, ClientPacket::KeepAlive(keep_alive_value)))
         }
-        0x02 => {
-            // Handshake packet
-            let (input, len) = take(2usize)(input)?; // Length of the username (2 bytes)
-            let username_len = u16::from_be_bytes([len[0], len[1]]) as usize;
-            let (input, username) = take(username_len * 2)(input)?; // Username (UTF-16, so 2 bytes per character)
-
-
-            Ok((input, ClientServerPackets::Handshake(String::from_utf16_lossy(
-                &username
-                    .chunks(2)
-                    .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
-                    .collect::<Vec<u16>>(),
-            ))))
+        packet_ids::HANDSHAKE => {
+            let (input, username) = parse_utf16_string(input)?;
+            Ok((input, ClientPacket::Handshake(username)))
         }
-        0x01 => {
-            // Login Start packet
-            let (input, protocol_version) = take(4usize)(input)?; // Protocol version (4 byte)
-            let protocol_version = i32::from_be_bytes([protocol_version[0], protocol_version[1], protocol_version[2], protocol_version[3]]);
-            let (input, username_len) = take(2usize)(input)?; // Length of the username (2 bytes)
-            let username_len = u16::from_be_bytes([username_len[0], username_len[1]]) as usize;
-            let (input, username) = take(username_len * 2)(input)?; // Username (UTF-16, so 2 bytes per character)
-            let (input, map_seed) = take(8usize)(input)?; // Map seed (8 bytes)
-            let map_seed = i64::from_be_bytes([
-                map_seed[0], map_seed[1], map_seed[2], map_seed[3],
-                map_seed[4], map_seed[5], map_seed[6], map_seed[7],
-            ]);
-            let (input, dimension) = take(1usize)(input)?; // Dimension (1 byte)
-            let dimension = dimension[0] as i8;
-            Ok((input, ClientServerPackets::LoginStart {
-                protocol_version: protocol_version,
-                username: String::from_utf16_lossy(
-                    &username
-                        .chunks(2)
-                        .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
-                        .collect::<Vec<u16>>(),
-                ),
+        packet_ids::LOGIN_REQUEST => {
+            let (input, protocol_version) = parse_i32(input)?;
+            let (input, username) = parse_utf16_string(input)?;
+            let (input, map_seed) = parse_i64(input)?;
+            let (input, dimension) = take(1usize)(input)?;
+            
+            Ok((input, ClientPacket::LoginRequest {
+                protocol_version,
+                username,
                 map_seed,
-                dimension,
+                dimension: dimension[0] as i8,
             }))
         }
-        // Player Position and Look packet (0x0b)
-        0x0b => {
-            let (input, x) = take(8usize)(input)?; // X coordinate (8 bytes)
-            let x = f64::from_be_bytes([
-                x[0], x[1], x[2], x[3],
-                x[4], x[5], x[6], x[7],
-            ]);
-            let (input, y) = take(8usize)(input)?; // Y coordinate (8 bytes)
-            let y = f64::from_be_bytes([
-                y[0], y[1], y[2], y[3],
-                y[4], y[5], y[6], y[7],
-            ]);
-            let (input, stance) = take(8usize)(input)?; // Stance
-            let stance = f64::from_be_bytes([
-                stance[0], stance[1], stance[2], stance[3],
-                stance[4], stance[5], stance[6], stance[7],
-            ]);
-            let (input, z) = take(8usize)(input)?; // Z coordinate
-            let z = f64::from_be_bytes([
-                z[0], z[1], z[2], z[3],
-                z[4], z[5], z[6], z[7],
-            ]);
-            let (input, on_ground) = take(1usize)(input)?; // On ground (1 byte)
-            let on_ground = on_ground[0] != 0; // Convert to bool
-            Ok((input, ClientServerPackets::PlayerPosition {
-                x,
-                y,
-                stance,
-                z,
-                on_ground,
-            }))
+        packet_ids::PLAYER_POSITION => {
+            let (input, x) = parse_f64(input)?;
+            let (input, y) = parse_f64(input)?;
+            let (input, stance) = parse_f64(input)?;
+            let (input, z) = parse_f64(input)?;
+            let (input, on_ground) = parse_bool(input)?;
+            
+            Ok((input, ClientPacket::PlayerPosition { x, y, stance, z, on_ground }))
         }
-        // Player Position and Look packet (0x0d)
-        0x0d => {
-            let (input, x) = take(8usize)(input)?; // X coordinate (8 bytes)
-            let x = f64::from_be_bytes([
-                x[0], x[1], x[2], x[3],
-                x[4], x[5], x[6], x[7],
-            ]);
-            let (input, y) = take(8usize)(input)?; // Y coordinate (8 bytes)
-            let y = f64::from_be_bytes([
-                y[0], y[1], y[2], y[3],
-                y[4], y[5], y[6], y[7],
-            ]);
-            let (input, stance) = take(8usize)(input)?; // Stance
-            let stance = f64::from_be_bytes([
-                stance[0], stance[1], stance[2], stance[3],
-                stance[4], stance[5], stance[6], stance[7],
-            ]);
-            let (input, z) = take(8usize)(input)?; // Z coordinate
-            let z = f64::from_be_bytes([
-                z[0], z[1], z[2], z[3],
-                z[4], z[5], z[6], z[7],
-            ]);
-            let (input, yaw) = take(4usize)(input)?; // Yaw
-            let yaw = f32::from_be_bytes([yaw[0], yaw[1], yaw[2], yaw[3]]);
-            let (input, pitch) = take(4usize)(input)?; // Pitch
-            let pitch = f32::from_be_bytes([pitch[0], pitch[1], pitch[2], pitch[3]]);
-            let (input, on_ground) = take(1usize)(input)?; // On ground (1 byte)
-            let on_ground = on_ground[0] != 0; // Convert to bool
-            Ok((input, ClientServerPackets::PlayerPositionAndLook {
-                x,
-                y,
-                stance,
-                z,
-                yaw,
-                pitch,
-                on_ground,
+        packet_ids::PLAYER_POSITION_AND_LOOK => {
+            let (input, x) = parse_f64(input)?;
+            let (input, y) = parse_f64(input)?;
+            let (input, stance) = parse_f64(input)?;
+            let (input, z) = parse_f64(input)?;
+            let (input, yaw) = parse_f32(input)?;
+            let (input, pitch) = parse_f32(input)?;
+            let (input, on_ground) = parse_bool(input)?;
+            
+            Ok((input, ClientPacket::PlayerPositionAndLook {
+                x, y, stance, z, yaw, pitch, on_ground,
             }))
         }
         _ => {
-            // Onbekend packet ID
             Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))
         }
     }
 }
 
 #[derive(Debug)]
-enum ClientServerPackets {
-    // 0x00 is Keep Alive
-    KeepAlive(i32), // Random integer sent by the client to keep the connection alive.
-
-    // 0x02
-    Handshake(String), // Username
-    //0x01
-    LoginStart {
+enum ClientPacket {
+    KeepAlive(i32),
+    Handshake(String),
+    LoginRequest {
         protocol_version: i32,
         username: String,
         map_seed: i64,
         dimension: i8,
     },
-    // 0x0b
     PlayerPosition {
         x: f64,
         y: f64,
-        stance: f64, // Used to modify the player's hitbox height
+        stance: f64,
         z: f64,
         on_ground: bool,
     },
-    // 0x0d Player Position and Look
     PlayerPositionAndLook {
         x: f64,
         y: f64,
-        stance: f64, // Used to modify the player's hitbox height
+        stance: f64,
         z: f64,
         yaw: f32,
         pitch: f32,
@@ -232,172 +253,349 @@ enum ClientServerPackets {
     }
 }
 
-enum ServerClientPackets {
-    // 0x00
-    KeepAlive(i32), // Random integer sent by the client to keep the connection alive, used for latency checks
-
-    // 0x02
-    Handshake(String), // Hash
-
-    // 0x01
-    LoginSuccess {
-        entity_id: i32,
+#[derive(Debug)]
+enum ServerPacket {
+    KeepAlive(i32),
+    Handshake(String),
+    LoginResponse {
+        entity_id: u32,
         level_type: String,
-        game_mode: u8,
-        dimension: i8,
+        map_seed: i64,
+        game_mode: i32,
+        dimension: u8,
         difficulty: u8,
-        max_players: u8,
-    }
-
-
+        world_height: i8,
+        max_players: i8,
+    },
+    SpawnPosition {
+        x: i32,
+        y: i32,
+        z: i32,
+    },
+    PlayerPositionAndLook {
+        x: f64,
+        y: f64,
+        stance: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+        on_ground: bool,
+    },
+    PreChunk {
+        x: i32,
+        z: i32,
+        mode: bool,
+    },
+    MapChunk {
+        x: i32,
+        y: i16,
+        z: i32,
+        size_x: u8,
+        size_y: u8,
+        size_z: u8,
+        compressed_data: Vec<u8>,
+    },
 }
 
-fn handle_packet(packet: ClientServerPackets, socket: &mut TcpStream) -> impl std::future::Future<Output = ()> {
-    async move {
-        match packet {
-            ClientServerPackets::KeepAlive(_) => {
-                println!("Keep Alive ontvangen");
-                
-                let response = [0x00, 0x00, 0x00, 0x00]; // Keep Alive response (4 bytes of random data)
-                if let Err(e) = socket.write_all(&response).await {
-                    eprintln!("Fout bij het verzenden van keep alive response: {}", e);
-                }
+impl ServerPacket {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        
+        match self {
+            ServerPacket::KeepAlive(value) => {
+                bytes.push(packet_ids::KEEP_ALIVE);
+                bytes.extend_from_slice(&value.to_be_bytes());
             }
-            ClientServerPackets::Handshake(username) => {
-                println!("Handshake ontvangen van gebruiker: {}", username);
-                
-                // Send back a handshake response (for demonstration purposes, we just send a simple message)
-                // Send "-" some hash back to the client (for demonstration purposes, we use a fixed hash)
-                let response = [
-                    0x02, // Packet ID for Handshake response
-                    0x00, 0x01, // Length of the hash (1 byte)
-                    0x00, '-' as u8, // The hash character '-'
-                ];
-                if let Err(e) = socket.write_all(&response).await {
-                    eprintln!("Fout bij het verzenden van handshake response: {}", e);
-                }
-
-                println!("Handshake response verzonden");
+            ServerPacket::Handshake(hash) => {
+                bytes.push(packet_ids::HANDSHAKE);
+                write_utf16_string(&mut bytes, hash);
             }
-            ClientServerPackets::LoginStart { protocol_version, username, map_seed, dimension } => {
-                println!("Login Start ontvangen");
+            ServerPacket::LoginResponse {
+                entity_id,
+                level_type,
+                map_seed,
+                game_mode,
+                dimension,
+                difficulty,
+                world_height,
+                max_players,
+            } => {
+                bytes.push(packet_ids::LOGIN_REQUEST);
+                bytes.extend_from_slice(&entity_id.to_be_bytes());
                 
-                let entity_id: u32 = 1;
-                let level_type = "".to_string();
-                let map_seed: i64 = 1234;
-                let game_mode: i32 = 0;
-                let dimension: u8 = 0;
-                let difficulty: u8 = 1;
-                let world_height: i8 = 127;
-                let max_players: i8 = 20;
-
-                // Serialize the LoginSuccess response                
-                let mut response_bytes = Vec::new();
-                response_bytes.push(0x01); // Packet ID for LoginSuccess
-                response_bytes.extend_from_slice(&entity_id.to_be_bytes());
-
+                // Write string length
                 let level_type_bytes = level_type.as_bytes();
-                response_bytes.extend_from_slice(&(level_type_bytes.len() as u16).to_be_bytes());
+                bytes.extend_from_slice(&(level_type_bytes.len() as u16).to_be_bytes());
                 
-                let map_seed_bytes = map_seed.to_be_bytes();
-                response_bytes.extend_from_slice(&map_seed_bytes);
-
-                // send every character as UTF-16 (2 bytes per character)
+                // Write UTF-16 string content
                 for byte in level_type_bytes {
-                    response_bytes.extend_from_slice(&[0x00, *byte]);
+                    bytes.extend_from_slice(&[0x00, *byte]);
                 }
-                response_bytes.extend_from_slice(&game_mode.to_be_bytes());
-                response_bytes.push(dimension as u8);
-                response_bytes.push(difficulty);
-                response_bytes.push(world_height as u8);
-                response_bytes.push(max_players as u8);
-
-                if let Err(e) = socket.write_all(&response_bytes).await {
-                    eprintln!("Fout bij het verzenden van login success response: {}", e);
-                }
-
-                println!("Login success response verzonden");
-
-                // Send Spawn Position packet (0x06) as an example of sending another packet after login success
-                let spawn_x: i32 = 0;
-                let spawn_y: i32 = 64;
-                let spawn_z: i32 = 0;
-                let mut spawn_response = Vec::new();
-                spawn_response.push(0x06); // Packet ID for Spawn Position
-                spawn_response.extend_from_slice(&spawn_x.to_be_bytes());
-                spawn_response.extend_from_slice(&spawn_y.to_be_bytes());
-                spawn_response.extend_from_slice(&spawn_z.to_be_bytes());
-
-                if let Err(e) = socket.write_all(&spawn_response).await {
-                    eprintln!("Fout bij het verzenden van spawn position response: {}", e);
-                }
-
-                // Sen Player Position & Look (0x0D)
-                let x: f64 = 0.0;
-                let stance: f64 = 0.0;
-                let y: f64 = 64.0;
-                let z: f64 = 0.0;
-                let yaw: f32 = 0.0;
-                let pitch: f32 = 0.0;
-                let on_ground: bool = true;
-
-                let mut position_response = Vec::new();
-                position_response.push(0x0D); // Packet ID for Player Position & Look
-                position_response.extend_from_slice(&x.to_be_bytes());
-                position_response.extend_from_slice(&stance.to_be_bytes());
-                position_response.extend_from_slice(&y.to_be_bytes());
-                position_response.extend_from_slice(&z.to_be_bytes());
-                position_response.extend_from_slice(&yaw.to_be_bytes());
-                position_response.extend_from_slice(&pitch.to_be_bytes());
-                position_response.push(if on_ground { 1 } else { 0 });
-
-                // Send pre-chunk data (0x32) 
-                let chunk_x: i32 = 0;
-                let chunk_z: i32 = 0;
-                let mode: bool = true; // True for load chunk, false for unload chunk
-                let mut chunk_response = Vec::new();
-                chunk_response.push(0x32); // Packet ID for Pre-Chunk Data
-                chunk_response.extend_from_slice(&chunk_x.to_be_bytes());
-                chunk_response.extend_from_slice(&chunk_z.to_be_bytes());
-                chunk_response.push(if mode { 1 } else { 0 });
-
-                if let Err(e) = socket.write_all(&position_response).await {
-                    eprintln!("Fout bij het verzenden van player position response: {}", e);
-                }
-
-                // Send map chunk data (0x33)
-                let chunk_x: i32 = 0;
-                let chunk_y: i16 = 0;
-                let chunk_z: i32 = 0;
-                let size_x: u8 = 16;
-                let size_y: u8 = 128;
-                let size_z: u8 = 16;
                 
-                let data = vec![0u8; (size_x as usize) * (size_y as usize) * (size_z as usize) / 2]; // Example chunk data (half the size of the chunk, since it's compressed)
-                let mut compressed_data = Vec::with_capacity(data.len());
-                zlib_rs::compress_slice(&mut compressed_data, &data, zlib_rs::DeflateConfig::best_compression());
-
-                let mut chunk_data_response = Vec::new();
-                chunk_data_response.push(0x33); // Packet ID for Map Chunk Data
-                chunk_data_response.extend_from_slice(&chunk_x.to_be_bytes());
-                chunk_data_response.extend_from_slice(&chunk_y.to_be_bytes());
-                chunk_data_response.extend_from_slice(&chunk_z.to_be_bytes());
-                chunk_data_response.push(size_x);
-                chunk_data_response.push(size_y);
-                chunk_data_response.push(size_z);
-                chunk_data_response.extend_from_slice(&(compressed_data.len() as i32).to_be_bytes());
-                chunk_data_response.extend_from_slice(&compressed_data);
-
-                if let Err(e) = socket.write_all(&chunk_data_response).await {
-                    eprintln!("Fout bij het verzenden van chunk data response: {}", e);
-                }
-            },
-            ClientServerPackets::PlayerPosition { x, y, stance, z, on_ground } => {
-                println!("Player Position ontvangen: x={}, y={}, stance={}, z={}, on_ground={}", x, y, stance, z, on_ground);
+                // Write map_seed (between length and string content)
+                bytes.extend_from_slice(&map_seed.to_be_bytes());
+                
+                bytes.extend_from_slice(&game_mode.to_be_bytes());
+                bytes.push(*dimension);
+                bytes.push(*difficulty);
+                bytes.push(*world_height as u8);
+                bytes.push(*max_players as u8);
             }
-            ClientServerPackets::PlayerPositionAndLook { x, y, stance, z, yaw, pitch, on_ground } => {
-                println!("Player Position and Look ontvangen: x={}, y={}, stance={}, z={}, yaw={}, pitch={}, on_ground={}", x, y, stance, z, yaw, pitch, on_ground);
+            ServerPacket::SpawnPosition { x, y, z } => {
+                bytes.push(packet_ids::SPAWN_POSITION);
+                bytes.extend_from_slice(&x.to_be_bytes());
+                bytes.extend_from_slice(&y.to_be_bytes());
+                bytes.extend_from_slice(&z.to_be_bytes());
+            }
+            ServerPacket::PlayerPositionAndLook { x, y, stance, z, yaw, pitch, on_ground } => {
+                bytes.push(packet_ids::PLAYER_POSITION_AND_LOOK);
+                bytes.extend_from_slice(&x.to_be_bytes());
+                bytes.extend_from_slice(&y.to_be_bytes());
+                bytes.extend_from_slice(&stance.to_be_bytes());
+                bytes.extend_from_slice(&z.to_be_bytes());
+                bytes.extend_from_slice(&yaw.to_be_bytes());
+                bytes.extend_from_slice(&pitch.to_be_bytes());
+                bytes.push(if *on_ground { 1 } else { 0 });
+            }
+            ServerPacket::PreChunk { x, z, mode } => {
+                bytes.push(packet_ids::PRE_CHUNK);
+                bytes.extend_from_slice(&x.to_be_bytes());
+                bytes.extend_from_slice(&z.to_be_bytes());
+                bytes.push(if *mode { 1 } else { 0 });
+            }
+            ServerPacket::MapChunk { x, y, z, size_x, size_y, size_z, compressed_data } => {
+                bytes.push(packet_ids::MAP_CHUNK);
+                bytes.extend_from_slice(&x.to_be_bytes());
+                bytes.extend_from_slice(&y.to_be_bytes());
+                bytes.extend_from_slice(&z.to_be_bytes());
+                bytes.push(*size_x);
+                bytes.push(*size_y);
+                bytes.push(*size_z);
+                bytes.extend_from_slice(&(compressed_data.len() as i32).to_be_bytes());
+                bytes.extend_from_slice(compressed_data);
+            }
+        }
+        
+        bytes
+    }
+}
+
+async fn handle_packet(packet: ClientPacket, socket: &mut TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+    match packet {
+        ClientPacket::KeepAlive(value) => {
+            println!("Keep alive received");
+            send_packet(socket, ServerPacket::KeepAlive(value)).await?;
+        }
+        ClientPacket::Handshake(username) => {
+            println!("Handshake received from: {}", username);
+            send_packet(socket, ServerPacket::Handshake("-".to_string())).await?;
+        }
+        ClientPacket::LoginRequest { protocol_version: _, username, map_seed: _, dimension: _ } => {
+            println!("Login request received from: {}", username);
+            handle_login(socket).await?;
+        }
+        ClientPacket::PlayerPosition { x, y, stance, z, on_ground } => {
+            println!("Player position: x={}, y={}, stance={}, z={}, on_ground={}", x, y, stance, z, on_ground);
+        }
+        ClientPacket::PlayerPositionAndLook { x, y, stance, z, yaw, pitch, on_ground } => {
+            println!("Player position and look: x={}, y={}, stance={}, z={}, yaw={}, pitch={}, on_ground={}", 
+                x, y, stance, z, yaw, pitch, on_ground);
+        }
+    }
+    Ok(())
+}
+
+async fn send_packet(socket: &mut TcpStream, packet: ServerPacket) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = packet.to_bytes();
+    socket.write_all(&bytes).await?;
+    Ok(())
+}
+
+async fn handle_login(socket: &mut TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+    // Send login response
+    send_packet(socket, ServerPacket::LoginResponse {
+        entity_id: 1,
+        level_type: "".to_string(),
+        map_seed: 1234,
+        game_mode: 0,
+        dimension: 0,
+        difficulty: 1,
+        world_height: 127,
+        max_players: 20,
+    }).await?;
+
+    // Send spawn position first
+    send_packet(socket, ServerPacket::SpawnPosition {
+        x: 0,
+        y: 64,
+        z: 0,
+    }).await?;
+
+    // IMPORTANT: Send chunks BEFORE player position
+    // Send a small 3x3 plain of chunks around spawn
+    println!("Sending chunks...");
+    for cz in -1..=1 {
+        for cx in -1..=1 {
+            send_grass_chunk(socket, cx, cz).await?;
+        }
+    }
+    println!("All chunks sent!");
+
+    // Now send player position after chunks are loaded
+    println!("Sending player position...");
+    send_packet(socket, ServerPacket::PlayerPositionAndLook {
+        x: 0.5,
+        y: 65.0,
+        stance: 66.62,  // Y + 1.62 (eye height)
+        z: 0.5,
+        yaw: 0.0,
+        pitch: 0.0,
+        on_ground: false,
+    }).await?;
+    println!("Login sequence complete!");
+
+    Ok(())
+}
+
+fn generate_grass_plain_chunk(size_x: u8, size_y: u8, size_z: u8) -> Vec<u8> {
+    // Block IDs
+    const AIR: u8 = 0;
+    const STONE: u8 = 1;
+    const GRASS: u8 = 2;
+    const DIRT: u8 = 3;
+    
+    const GROUND_LEVEL: u8 = 63;  // Top grass block
+    const DIRT_LAYERS: u8 = 3;
+    
+    let blocks_size = (size_x as usize) * (size_y as usize) * (size_z as usize);
+    
+    // Data size as per spec: (Size_X+1) * (Size_Y+1) * (Size_Z+1) * 2.5 bytes
+    let total_size = blocks_size + (blocks_size / 2) * 3; // blocks + metadata + block_light + sky_light
+    
+    let mut data = Vec::with_capacity(total_size);
+    
+    // Block type array - index = y + (z * Size_Y) + (x * Size_Y * Size_Z)
+    // This means: for x, for z, for y (X outer, Z middle, Y inner)
+    for _x in 0..size_x {
+        for _z in 0..size_z {
+            for y in 0..size_y {
+                let block = if y < GROUND_LEVEL - DIRT_LAYERS {
+                    STONE
+                } else if y < GROUND_LEVEL {
+                    DIRT
+                } else if y == GROUND_LEVEL {
+                    GRASS
+                } else {
+                    AIR
+                };
+                data.push(block);
             }
         }
     }
+    
+    // Metadata array (nibbles) - same iteration order, pack 2 per byte
+    // Low 4 bits = lower Y, high 4 bits = higher Y
+    for _x in 0..size_x {
+        for _z in 0..size_z {
+            for _y in (0..size_y).step_by(2) {
+                // Pack two nibbles: y and y+1
+                let nibble_low = 0u8;  // metadata for y
+                let nibble_high = 0u8; // metadata for y+1
+                data.push((nibble_high << 4) | nibble_low);
+            }
+        }
+    }
+    
+    // Block light array (nibbles) - same pattern
+    for _x in 0..size_x {
+        for _z in 0..size_z {
+            for _y in (0..size_y).step_by(2) {
+                let nibble_low = 0u8;
+                let nibble_high = 0u8;
+                data.push((nibble_high << 4) | nibble_low);
+            }
+        }
+    }
+    
+    // Sky light array (nibbles) - full brightness above ground
+    for _x in 0..size_x {
+        for _z in 0..size_z {
+            for y in (0..size_y).step_by(2) {
+                // Each nibble is 0xF (full brightness) above ground, 0x0 below
+                let nibble_low = if y > GROUND_LEVEL { 0xF } else { 0x0 };
+                let nibble_high = if y + 1 > GROUND_LEVEL { 0xF } else { 0x0 };
+                data.push((nibble_high << 4) | nibble_low);
+            }
+        }
+    }
+    
+    data
+}
+
+async fn send_grass_chunk(socket: &mut TcpStream, chunk_x: i32, chunk_z: i32) -> Result<(), Box<dyn std::error::Error>> {
+    const CHUNK_SIZE_X: u8 = 16;
+    const CHUNK_SIZE_Y: u8 = 128;
+    const CHUNK_SIZE_Z: u8 = 16;
+    
+    // Calculate expected size per spec: (Size_X+1) * (Size_Y+1) * (Size_Z+1) * 2.5
+    let blocks = (CHUNK_SIZE_X as usize) * (CHUNK_SIZE_Y as usize) * (CHUNK_SIZE_Z as usize);
+    let expected_total = (blocks as f32 * 2.5) as usize;
+    
+    // Generate terrain data
+    let data = generate_grass_plain_chunk(CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z);
+    
+    println!("Chunk ({}, {}): generated {} bytes (expected {})", 
+        chunk_x, chunk_z, data.len(), expected_total);
+    println!("  First 32 bytes of uncompressed: {:02X?}", &data[..32.min(data.len())]);
+    
+    // Compress using zlib format (deflate with zlib wrapper)
+    // Minecraft expects standard zlib format with header and checksum
+    // compress_slice needs a pre-allocated buffer
+    let mut compress_buffer = vec![0u8; data.len() * 2]; // Allocate enough space
+    let (compressed_slice, status) = zlib_rs::compress_slice(
+        &mut compress_buffer, 
+        &data, 
+        zlib_rs::DeflateConfig::default()
+    );
+    
+    // Check compression status
+    if status != zlib_rs::ReturnCode::Ok {
+        eprintln!("  ✗ Compression failed with status: {:?}", status);
+        return Err("Compression failed".into());
+    }
+    
+    // Copy the compressed data (compress_slice returns a slice of the buffer it used)
+    let compressed_data = compressed_slice.to_vec();
+    
+    println!("  Compressed to {} bytes", compressed_data.len());
+    
+    // Verify zlib format
+    if verify_zlib_format(&compressed_data) {
+        println!("  ✓ Valid zlib compression format (header: {:02X} {:02X})", 
+            compressed_data[0], compressed_data[1]);
+    } else {
+        println!("  ✗ Invalid compression format - Minecraft may reject this chunk!");
+    }
+
+    // Send pre-chunk packet (0x32)
+    send_packet(socket, ServerPacket::PreChunk {
+        x: chunk_x,
+        z: chunk_z,
+        mode: true,
+    }).await?;
+
+    // Send chunk data (0x33)
+    // Per spec: X, Y, Z are BLOCK coordinates (not chunk)
+    // Sizes are actual size - 1
+    send_packet(socket, ServerPacket::MapChunk {
+        x: chunk_x * 16,  // Convert chunk coord to block coord
+        y: 0,             // Start from bedrock
+        z: chunk_z * 16,  // Convert chunk coord to block coord
+        size_x: CHUNK_SIZE_X - 1,  // 15 (actual size 16)
+        size_y: CHUNK_SIZE_Y - 1,  // 127 (actual size 128)
+        size_z: CHUNK_SIZE_Z - 1,  // 15 (actual size 16)
+        compressed_data,
+    }).await?;
+
+    Ok(())
 }
