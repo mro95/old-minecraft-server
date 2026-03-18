@@ -1,0 +1,184 @@
+use crate::packet_ids;
+
+/// Packets sent from the client to the server
+#[derive(Debug)]
+pub enum ClientPacket {
+    KeepAlive(i32),
+    Handshake(String),
+    LoginRequest {
+        protocol_version: i32,
+        username: String,
+        map_seed: i64,
+        dimension: i8,
+    },
+    PlayerPosition {
+        x: f64,
+        y: f64,
+        stance: f64,
+        z: f64,
+        on_ground: bool,
+    },
+    PlayerPositionAndLook {
+        x: f64,
+        y: f64,
+        stance: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+        on_ground: bool,
+    },
+}
+
+/// Packets sent from the server to the client
+#[derive(Debug)]
+pub enum ServerPacket {
+    KeepAlive(i32),
+    Handshake(String),
+    LoginResponse {
+        entity_id: u32,
+        level_type: String,
+        map_seed: i64,
+        game_mode: i32,
+        dimension: u8,
+        difficulty: u8,
+        world_height: i8,
+        max_players: i8,
+    },
+    SpawnPosition {
+        x: i32,
+        y: i32,
+        z: i32,
+    },
+    PlayerPositionAndLook {
+        x: f64,
+        y: f64,
+        stance: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+        on_ground: bool,
+    },
+    PreChunk {
+        x: i32,
+        z: i32,
+        mode: bool,
+    },
+    MapChunk {
+        x: i32,
+        y: i16,
+        z: i32,
+        size_x: u8,
+        size_y: u8,
+        size_z: u8,
+        compressed_data: Vec<u8>,
+    },
+}
+
+impl ServerPacket {
+    /// Serialize packet to bytes for network transmission
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        match self {
+            ServerPacket::KeepAlive(value) => {
+                bytes.push(packet_ids::KEEP_ALIVE);
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            ServerPacket::Handshake(hash) => {
+                bytes.push(packet_ids::HANDSHAKE);
+                write_utf16_string(&mut bytes, hash);
+            }
+            ServerPacket::LoginResponse {
+                entity_id,
+                level_type,
+                map_seed,
+                game_mode,
+                dimension,
+                difficulty,
+                world_height,
+                max_players,
+            } => {
+                bytes.push(packet_ids::LOGIN_REQUEST);
+                bytes.extend_from_slice(&entity_id.to_be_bytes());
+
+                // Write string length
+                let level_type_bytes = level_type.as_bytes();
+                bytes.extend_from_slice(&(level_type_bytes.len() as u16).to_be_bytes());
+
+                // Write UTF-16 string content
+                for byte in level_type_bytes {
+                    bytes.extend_from_slice(&[0x00, *byte]);
+                }
+
+                // Write map_seed (between length and string content)
+                bytes.extend_from_slice(&map_seed.to_be_bytes());
+
+                bytes.extend_from_slice(&game_mode.to_be_bytes());
+                bytes.push(*dimension);
+                bytes.push(*difficulty);
+                bytes.push(*world_height as u8);
+                bytes.push(*max_players as u8);
+            }
+            ServerPacket::SpawnPosition { x, y, z } => {
+                bytes.push(packet_ids::SPAWN_POSITION);
+                bytes.extend_from_slice(&x.to_be_bytes());
+                bytes.extend_from_slice(&y.to_be_bytes());
+                bytes.extend_from_slice(&z.to_be_bytes());
+            }
+            ServerPacket::PlayerPositionAndLook {
+                x,
+                y,
+                stance,
+                z,
+                yaw,
+                pitch,
+                on_ground,
+            } => {
+                bytes.push(packet_ids::PLAYER_POSITION_AND_LOOK);
+                bytes.extend_from_slice(&x.to_be_bytes());
+                bytes.extend_from_slice(&y.to_be_bytes());
+                bytes.extend_from_slice(&stance.to_be_bytes());
+                bytes.extend_from_slice(&z.to_be_bytes());
+                bytes.extend_from_slice(&yaw.to_be_bytes());
+                bytes.extend_from_slice(&pitch.to_be_bytes());
+                bytes.push(if *on_ground { 1 } else { 0 });
+            }
+            ServerPacket::PreChunk { x, z, mode } => {
+                bytes.push(packet_ids::PRE_CHUNK);
+                bytes.extend_from_slice(&x.to_be_bytes());
+                bytes.extend_from_slice(&z.to_be_bytes());
+                bytes.push(if *mode { 1 } else { 0 });
+            }
+            ServerPacket::MapChunk {
+                x,
+                y,
+                z,
+                size_x,
+                size_y,
+                size_z,
+                compressed_data,
+            } => {
+                bytes.push(packet_ids::MAP_CHUNK);
+                bytes.extend_from_slice(&x.to_be_bytes());
+                bytes.extend_from_slice(&y.to_be_bytes());
+                bytes.extend_from_slice(&z.to_be_bytes());
+                bytes.push(*size_x);
+                bytes.push(*size_y);
+                bytes.push(*size_z);
+                bytes.extend_from_slice(&(compressed_data.len() as i32).to_be_bytes());
+                bytes.extend_from_slice(compressed_data);
+            }
+        }
+
+        bytes
+    }
+}
+
+/// Helper function to write UTF-16 strings in Minecraft protocol format
+fn write_utf16_string(buffer: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    buffer.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    for byte in bytes {
+        buffer.extend_from_slice(&[0x00, *byte]);
+    }
+}
