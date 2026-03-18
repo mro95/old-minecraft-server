@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
 
 use crate::packets::{ClientPacket, ServerPacket};
-use crate::player::Player;
+use crate::player::{Player, broadcast_packet};
 use crate::world;
 use crate::{PlayerRegistry, protocol};
 
@@ -191,11 +191,15 @@ async fn handle_packet(
         ClientPacket::ChatMessage(message) => {
             info!(message = %message, "Chat message received");
 
-            player
-                .write()
-                .await
-                .send_packet(ServerPacket::ChatMessage(format!("Echo: {}", message)))
-                .await?;
+            broadcast_packet(
+                &players,
+                ServerPacket::ChatMessage(format!(
+                    "{}: {}",
+                    player.read().await.get_username().unwrap_or_default(),
+                    message
+                )),
+            )
+            .await?;
         }
         ClientPacket::Player { on_ground } => {
             debug!(on_ground, "Player on-ground status update");

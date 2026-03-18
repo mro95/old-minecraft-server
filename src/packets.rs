@@ -65,7 +65,7 @@ pub enum ClientPacket {
 }
 
 /// Packets sent from the server to the client
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ServerPacket {
     KeepAlive(i32),
     Handshake(String),

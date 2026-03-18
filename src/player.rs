@@ -67,6 +67,10 @@ impl Player {
     pub fn set_username(&mut self, username: String) {
         self.username = Some(username);
     }
+
+    pub fn get_username(&self) -> Option<String> {
+        self.username.clone()
+    }
 }
 
 pub async fn get_player_list(players: &PlayerRegistry) -> Vec<(SocketAddr, String, Option<i32>)> {
@@ -111,6 +115,23 @@ pub async fn send_player_list_update(
                     ping: latency,
                 })
                 .await?;
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn broadcast_packet(
+    players: &PlayerRegistry,
+    packet: ServerPacket,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let player_list = get_player_list(players).await;
+
+    for (addr, _, _) in player_list {
+        let players_lock = players.read().await;
+        if let Some(player_arc) = players_lock.get(&addr) {
+            let mut player = player_arc.write().await;
+            player.send_packet(packet.clone()).await?;
         }
     }
 
