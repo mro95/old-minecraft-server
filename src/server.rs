@@ -1,14 +1,16 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::net::tcp::OwnedWriteHalf;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
 
 use crate::packets::{ClientPacket, ServerPacket};
-use crate::protocol;
+use crate::player::Player;
+use crate::{PlayerRegistry, protocol};
 use crate::world;
 
 const CHUNK_SIZE_X: u8 = 16;
@@ -16,34 +18,54 @@ const CHUNK_SIZE_Y: u8 = 128;
 const CHUNK_SIZE_Z: u8 = 16;
 
 /// Handle an incoming client connection
-#[instrument(skip(socket))]
-pub async fn handle_connection(socket: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+#[instrument(skip(socket, players))]
+pub async fn handle_connection(socket: TcpStream, players: PlayerRegistry) -> Result<(), Box<dyn std::error::Error>> {
     socket.set_nodelay(true)?; // Disable Nagle's algorithm for lower latency
     info!("Connection established");
+
+    let (mut read_half, write_half) = socket.into_split();
+    let write_half = Arc::new(Mutex::new(write_half));
+
+    let player = Player::new(write_half.clone());
+    let player = Arc::new(RwLock::new(player));
+    players.write().await.insert(write_half.lock().await.peer_addr()?, Arc::clone(&player));
 
     let mut buffer = BytesMut::with_capacity(1024);
     let mut read_buf = [0u8; 1024];
 
-    let socket = Arc::new(Mutex::new(socket)); // Wrap socket in Arc<Mutex> for shared access
-
     // Spawn keep-alive task
-    let keepalive_socket = Arc::clone(&socket);
+    let players_tick = Arc::clone(&players);
+    let player_tick = Arc::clone(&player);
     let keep_alive_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
-            interval.tick().await;
-            let mut sock = keepalive_socket.lock().await;
-            if let Err(e) = send_packet(&mut sock, ServerPacket::KeepAlive(0)).await {
-                debug!(error = %e, "Failed to send keep-alive, connection likely closed");
-                break; // Exit task on error (e.g. connection closed)
+            let tick = interval.tick().await;
+
+            {
+                let mut player_tick = player_tick.write().await;
+                let keepalive_id = player_tick.start_latency_measurement();
+
+                if let Err(e) = player_tick.send_packet(ServerPacket::KeepAlive(keepalive_id)).await {
+                    debug!(error = %e, "Failed to send keep-alive, connection likely closed");
+                    player_tick.pending_keepalive.remove(&keepalive_id); // Clean up if send failed
+                    break; // Exit task on error (e.g. connection closed)
+                }
+            }
+
+            // Send player list update every 5 seconds
+            if tick.elapsed().as_secs() % 5 == 0 {
+                let player_list = crate::player::get_player_list(&players_tick).await;
+                info!(player_count = player_list.len(), "Current player list");
+                crate::player::send_player_list_update(&players_tick).await.unwrap_or_else(|e| {
+                    debug!(error = %e, "Failed to send player list update");
+                });
             }
         }
     });
 
     loop {
         let n = {
-            let mut sock = socket.lock().await;
-            tokio::time::timeout(Duration::from_secs(30), sock.read(&mut read_buf)).await??
+            tokio::time::timeout(Duration::from_secs(30), read_half.read(&mut read_buf)).await?? // Add timeout to prevent hanging
         };
 
         if n == 0 {
@@ -53,17 +75,27 @@ pub async fn handle_connection(socket: TcpStream) -> Result<(), Box<dyn std::err
         }
 
         buffer.extend_from_slice(&read_buf[..n]);
+        
+        // Log what we just read AND the total buffer state
+        if n > 0 {
+            debug!(bytes_read = n, 
+                   read_hex = hex::encode(&read_buf[..n.min(50)]),
+                   buffer_total = buffer.len(),
+                   buffer_start = hex::encode(&buffer.chunk()[..buffer.len().min(10)]),
+                   "Read from socket");
+        }
 
         while !buffer.is_empty() {
             match protocol::parse_packet(&buffer) {
                 Ok((remaining, packet)) => {
-                    debug!(?packet, "Parsed packet");
-
                     let consumed = buffer.len() - remaining.len();
+                    debug!(?packet, consumed_bytes = consumed, 
+                           packet_id = format!("0x{:02X}", buffer.chunk()[0]),
+                           "Parsed packet");
+
                     buffer.advance(consumed);
 
-                    let mut sock = socket.lock().await; // Lock socket for sending response
-                    handle_packet(packet, &mut sock).await?;
+                    handle_packet(packet, player.clone(), players.clone()).await?;
                 }
                 Err(nom::Err::Incomplete(_)) => {
                     // Need more data
@@ -94,19 +126,28 @@ pub async fn handle_connection(socket: TcpStream) -> Result<(), Box<dyn std::err
 }
 
 /// Handle a parsed client packet
-#[instrument(skip(socket))]
+#[instrument(skip(player, players))]
 async fn handle_packet(
     packet: ClientPacket,
-    socket: &mut TcpStream,
+    player: Arc<RwLock<Player>>,
+    players: PlayerRegistry,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match packet {
         ClientPacket::KeepAlive(value) => {
-            debug!("Keep alive received");
-            send_packet(socket, ServerPacket::KeepAlive(value)).await?;
+            info!(value, "Keep alive received from client");
+            
+            let mut player = player.write().await;
+            if let Some(pending) = player.pending_keepalive.remove(&value) {
+                let latency = pending.elapsed().as_millis() as i16;
+                player.last_latency = Some(Duration::from_millis(latency as u64));
+                info!(latency_ms = latency, "Keep-alive response received, latency updated");
+            } else {
+                info!("Received unexpected keep-alive value: {}, ignoring", value);
+            }
         }
         ClientPacket::Handshake(username) => {
             info!(username = %username, "Handshake received");
-            send_packet(socket, ServerPacket::Handshake("-".to_string())).await?;
+            player.write().await.send_packet(ServerPacket::Handshake("-".to_string())).await?;
         }
         ClientPacket::LoginRequest {
             protocol_version,
@@ -121,12 +162,15 @@ async fn handle_packet(
                 dimension,
                 "Login request received"
             );
-            handle_login(socket).await?;
+            player.write().await.set_username(username.clone());
+            handle_login(player.clone(), players.clone()).await?;
         }
         ClientPacket::ChatMessage(message) => {
             info!(message = %message, "Chat message received");
             
-            send_packet(socket, ServerPacket::ChatMessage(format!("Echo: {}", message))).await?;
+            player.write().await.send_packet(
+                ServerPacket::ChatMessage(format!("Echo: {}", message))
+            ).await?;
         }
         ClientPacket::Player { on_ground } => {
             debug!(on_ground, "Player on-ground status update");
@@ -196,6 +240,18 @@ async fn handle_packet(
         }
         ClientPacket::Disconnect(reason) => {
             info!(reason = %reason, "Client disconnect");
+            // Clean up player from registry
+            let mut players_lock = players.write().await;
+            if let Some(addr) = player.read().await.get_socket().lock().await.peer_addr().ok() {
+                players_lock.remove(&addr);
+                info!(address = %addr, "Player removed from registry");
+            } else {
+                warn!("Could not get player address for cleanup");
+            }
+
+            // Close socket by dropping write half
+            player.write().await.get_socket().lock().await.shutdown().await?;
+
             return Err("Client disconnected".into());
         }
     }
@@ -205,23 +261,22 @@ async fn handle_packet(
 /// Send a packet to the client
 #[instrument(skip(socket, packet))]
 async fn send_packet(
-    socket: &mut TcpStream,
+    socket: Arc<Mutex<OwnedWriteHalf>>,
     packet: ServerPacket,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bytes = packet.to_bytes();
-    socket.write_all(&bytes).await?;
+    socket.lock().await.write_all(&bytes).await?;
     debug!(size = bytes.len(), "Sent packet");
     Ok(())
 }
 
 /// Handle login sequence for a new player
-#[instrument(skip(socket))]
-async fn handle_login(socket: &mut TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+#[instrument(skip(player, players))]
+async fn handle_login(player: Arc<RwLock<Player>>, players: PlayerRegistry) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting login sequence");
 
     // Send login response
-    send_packet(
-        socket,
+    player.write().await.send_packet(
         ServerPacket::LoginResponse {
             entity_id: 1,
             level_type: "".to_string(),
@@ -236,8 +291,7 @@ async fn handle_login(socket: &mut TcpStream) -> Result<(), Box<dyn std::error::
     .await?;
 
     // Send spawn position first
-    send_packet(
-        socket,
+    player.write().await.send_packet(
         ServerPacket::SpawnPosition {
             x: 0,
             y: 64,
@@ -251,14 +305,14 @@ async fn handle_login(socket: &mut TcpStream) -> Result<(), Box<dyn std::error::
     info!("Sending chunks");
     for cz in -1..=1 {
         for cx in -1..=1 {
+            let socket = player.read().await.get_socket();
             send_grass_chunk(socket, cx, cz).await?;
         }
     }
     info!("All chunks sent");
 
     // Now send player position after chunks are loaded
-    send_packet(
-        socket,
+    player.write().await.send_packet(
         ServerPacket::PlayerPositionAndLook {
             x: 0.5,
             y: 65.0,
@@ -278,7 +332,7 @@ async fn handle_login(socket: &mut TcpStream) -> Result<(), Box<dyn std::error::
 /// Send a grass plain chunk to the client
 #[instrument(skip(socket))]
 async fn send_grass_chunk(
-    socket: &mut TcpStream,
+    socket: Arc<Mutex<OwnedWriteHalf>>,
     chunk_x: i32,
     chunk_z: i32,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -312,7 +366,7 @@ async fn send_grass_chunk(
 
     // Send pre-chunk packet (0x32)
     send_packet(
-        socket,
+        socket.clone(),
         ServerPacket::PreChunk {
             x: chunk_x,
             z: chunk_z,
@@ -325,7 +379,7 @@ async fn send_grass_chunk(
     // Per spec: X, Y, Z are BLOCK coordinates (not chunk)
     // Sizes are actual size - 1
     send_packet(
-        socket,
+        socket.clone(),
         ServerPacket::MapChunk {
             x: chunk_x * 16,      // Convert chunk coord to block coord
             y: 0,                 // Start from bedrock

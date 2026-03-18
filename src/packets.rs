@@ -108,6 +108,11 @@ pub enum ServerPacket {
         compressed_data: Vec<u8>,
     },
     ChatMessage(String),
+    PlayerListItem {
+        username: String,
+        online: bool,
+        ping: i16,
+    },
 }
 
 impl ServerPacket {
@@ -137,14 +142,8 @@ impl ServerPacket {
                 bytes.push(packet_ids::LOGIN_REQUEST);
                 bytes.extend_from_slice(&entity_id.to_be_bytes());
 
-                // Write string length
-                let level_type_bytes = level_type.as_bytes();
-                bytes.extend_from_slice(&(level_type_bytes.len() as u16).to_be_bytes());
-
-                // Write UTF-16 string content
-                for byte in level_type_bytes {
-                    bytes.extend_from_slice(&[0x00, *byte]);
-                }
+                // Write level type as UTF-16 string
+                write_utf16_string(&mut bytes, level_type);
 
                 // Write map_seed (between length and string content)
                 bytes.extend_from_slice(&map_seed.to_be_bytes());
@@ -207,6 +206,16 @@ impl ServerPacket {
             ServerPacket::ChatMessage(message) => {
                 bytes.push(packet_ids::CHAT_MESSAGE);
                 write_utf16_string(&mut bytes, message);
+            }
+            ServerPacket::PlayerListItem {
+                username,
+                online,
+                ping,
+            } => {
+                bytes.push(packet_ids::PLAYER_LIST_ITEM);
+                write_utf16_string(&mut bytes, username);
+                bytes.push(if *online { 1 } else { 0 });
+                bytes.extend_from_slice(&ping.to_be_bytes());
             }
         }
 
