@@ -71,7 +71,20 @@ pub async fn handle_connection(socket: TcpStream) -> Result<(), Box<dyn std::err
                     break;
                 }
                 Err(e) => {
-                    warn!(error = ?e, "Parse error, clearing buffer");
+                    // Log details about the error to help debug
+                    let buffer_preview = if buffer.len() > 0 {
+                        let preview_len = buffer.len().min(10);
+                        format!("{:02X?}", &buffer[..preview_len])
+                    } else {
+                        "empty".to_string()
+                    };
+                    
+                    warn!(
+                        error = ?e,
+                        buffer_len = buffer.len(),
+                        buffer_preview = %buffer_preview,
+                        "Parse error, clearing buffer"
+                    );
                     buffer.clear();
                     break;
                 }
@@ -110,6 +123,14 @@ async fn handle_packet(
             );
             handle_login(socket).await?;
         }
+        ClientPacket::ChatMessage(message) => {
+            info!(message = %message, "Chat message received");
+            
+            send_packet(socket, ServerPacket::ChatMessage(format!("Echo: {}", message))).await?;
+        }
+        ClientPacket::Player { on_ground } => {
+            debug!(on_ground, "Player on-ground status update");
+        }
         ClientPacket::PlayerPosition {
             x,
             y,
@@ -118,6 +139,13 @@ async fn handle_packet(
             on_ground,
         } => {
             debug!(x, y, stance, z, on_ground, "Player position update");
+        }
+        ClientPacket::PlayerLook {
+            yaw,
+            pitch,
+            on_ground,
+        } => {
+            debug!(yaw, pitch, on_ground, "Player look update");
         }
         ClientPacket::PlayerPositionAndLook {
             x,
@@ -132,6 +160,43 @@ async fn handle_packet(
                 x, y, stance, z, yaw, pitch, on_ground,
                 "Player position and look update"
             );
+        }
+        ClientPacket::PlayerDigging {
+            status,
+            x,
+            y,
+            z,
+            face,
+        } => {
+            debug!(status, x, y, z, face, "Player digging");
+            // TODO: Handle block breaking
+        }
+        ClientPacket::PlayerBlockPlacement {
+            x,
+            y,
+            z,
+            direction,
+            held_item,
+        } => {
+            debug!(x, y, z, direction, held_item, "Player block placement");
+            // TODO: Handle block placement
+        }
+        ClientPacket::HoldingChange { slot } => {
+            debug!(slot, "Player holding change");
+        }
+        ClientPacket::Animation {
+            entity_id,
+            animation,
+        } => {
+            debug!(entity_id, animation, "Player animation");
+        }
+        ClientPacket::EntityAction { entity_id, action } => {
+            debug!(entity_id, action, "Entity action");
+            // Actions: 1=crouch, 2=uncrouch, 3=leave bed, 4=start sprinting, 5=stop sprinting
+        }
+        ClientPacket::Disconnect(reason) => {
+            info!(reason = %reason, "Client disconnect");
+            return Err("Client disconnected".into());
         }
     }
     Ok(())

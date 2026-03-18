@@ -93,6 +93,14 @@ pub fn parse_packet(input: &[u8]) -> IResult<&[u8], ClientPacket> {
                 },
             ))
         }
+        packet_ids::CHAT_MESSAGE => {
+            let (input, message) = parse_utf16_string(input)?;
+            Ok((input, ClientPacket::ChatMessage(message)))
+        }
+        packet_ids::PLAYER => {
+            let (input, on_ground) = parse_bool(input)?;
+            Ok((input, ClientPacket::Player { on_ground }))
+        }
         packet_ids::PLAYER_POSITION => {
             let (input, x) = parse_f64(input)?;
             let (input, y) = parse_f64(input)?;
@@ -107,6 +115,20 @@ pub fn parse_packet(input: &[u8]) -> IResult<&[u8], ClientPacket> {
                     y,
                     stance,
                     z,
+                    on_ground,
+                },
+            ))
+        }
+        packet_ids::PLAYER_LOOK => {
+            let (input, yaw) = parse_f32(input)?;
+            let (input, pitch) = parse_f32(input)?;
+            let (input, on_ground) = parse_bool(input)?;
+
+            Ok((
+                input,
+                ClientPacket::PlayerLook {
+                    yaw,
+                    pitch,
                     on_ground,
                 },
             ))
@@ -132,6 +154,77 @@ pub fn parse_packet(input: &[u8]) -> IResult<&[u8], ClientPacket> {
                     on_ground,
                 },
             ))
+        }
+        packet_ids::PLAYER_DIGGING => {
+            let (input, status) = take(1usize)(input)?;
+            let (input, x) = parse_i32(input)?;
+            let (input, y) = take(1usize)(input)?;
+            let (input, z) = parse_i32(input)?;
+            let (input, face) = take(1usize)(input)?;
+
+            Ok((
+                input,
+                ClientPacket::PlayerDigging {
+                    status: status[0] as i8,
+                    x,
+                    y: y[0] as i8,
+                    z,
+                    face: face[0] as i8,
+                },
+            ))
+        }
+        packet_ids::PLAYER_BLOCK_PLACEMENT => {
+            let (input, x) = parse_i32(input)?;
+            let (input, y) = take(1usize)(input)?;
+            let (input, z) = parse_i32(input)?;
+            let (input, direction) = take(1usize)(input)?;
+            let (input, held_item_bytes) = take(2usize)(input)?;
+            let held_item = i16::from_be_bytes([held_item_bytes[0], held_item_bytes[1]]);
+
+            // Note: Full implementation would need to handle item stack data if held_item != -1
+            // For now, we'll assume no additional data
+
+            Ok((
+                input,
+                ClientPacket::PlayerBlockPlacement {
+                    x,
+                    y: y[0] as i8,
+                    z,
+                    direction: direction[0] as i8,
+                    held_item,
+                },
+            ))
+        }
+        packet_ids::HOLDING_CHANGE => {
+            let (input, slot_bytes) = take(2usize)(input)?;
+            let slot = i16::from_be_bytes([slot_bytes[0], slot_bytes[1]]);
+            Ok((input, ClientPacket::HoldingChange { slot }))
+        }
+        packet_ids::ANIMATION => {
+            let (input, entity_id) = parse_i32(input)?;
+            let (input, animation) = take(1usize)(input)?;
+            Ok((
+                input,
+                ClientPacket::Animation {
+                    entity_id,
+                    animation: animation[0] as i8,
+                },
+            ))
+        }
+        packet_ids::ENTITY_ACTION => {
+            let (input, entity_id) = parse_i32(input)?;
+            let (input, action) = take(1usize)(input)?;
+            Ok((
+                input,
+                ClientPacket::EntityAction {
+                    entity_id,
+                    action: action[0] as i8,
+                },
+            ))
+        }
+        packet_ids::DISCONNECT => {
+            let (input, reason) = parse_utf16_string(input)?;
+            Ok((input, ClientPacket::Disconnect(reason)))
         }
         _ => Err(nom::Err::Error(nom::error::Error::new(
             input,

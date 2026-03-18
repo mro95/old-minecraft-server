@@ -2,8 +2,17 @@
 pub const KEEP_ALIVE: u8 = 0x00;
 pub const LOGIN_REQUEST: u8 = 0x01;
 pub const HANDSHAKE: u8 = 0x02;
+pub const CHAT_MESSAGE: u8 = 0x03;
 pub const SPAWN_POSITION: u8 = 0x06;
+pub const PLAYER: u8 = 0x0A;
 pub const PLAYER_POSITION: u8 = 0x0B;
+pub const PLAYER_LOOK: u8 = 0x0C;
 pub const PLAYER_POSITION_AND_LOOK: u8 = 0x0D;
+pub const PLAYER_DIGGING: u8 = 0x0E;
+pub const PLAYER_BLOCK_PLACEMENT: u8 = 0x0F;
+pub const HOLDING_CHANGE: u8 = 0x10;
+pub const ANIMATION: u8 = 0x12;
+pub const ENTITY_ACTION: u8 = 0x13;
 pub const PRE_CHUNK: u8 = 0x32;
 pub const MAP_CHUNK: u8 = 0x33;
+pub const DISCONNECT: u8 = 0xFF;

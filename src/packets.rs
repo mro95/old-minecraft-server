@@ -11,11 +11,20 @@ pub enum ClientPacket {
         map_seed: i64,
         dimension: i8,
     },
+    ChatMessage(String),
+    Player {
+        on_ground: bool,
+    },
     PlayerPosition {
         x: f64,
         y: f64,
         stance: f64,
         z: f64,
+        on_ground: bool,
+    },
+    PlayerLook {
+        yaw: f32,
+        pitch: f32,
         on_ground: bool,
     },
     PlayerPositionAndLook {
@@ -27,6 +36,32 @@ pub enum ClientPacket {
         pitch: f32,
         on_ground: bool,
     },
+    PlayerDigging {
+        status: i8,
+        x: i32,
+        y: i8,
+        z: i32,
+        face: i8,
+    },
+    PlayerBlockPlacement {
+        x: i32,
+        y: i8,
+        z: i32,
+        direction: i8,
+        held_item: i16,
+    },
+    HoldingChange {
+        slot: i16,
+    },
+    Animation {
+        entity_id: i32,
+        animation: i8,
+    },
+    EntityAction {
+        entity_id: i32,
+        action: i8,
+    },
+    Disconnect(String),
 }
 
 /// Packets sent from the server to the client
@@ -72,6 +107,7 @@ pub enum ServerPacket {
         size_z: u8,
         compressed_data: Vec<u8>,
     },
+    ChatMessage(String),
 }
 
 impl ServerPacket {
@@ -167,6 +203,10 @@ impl ServerPacket {
                 bytes.push(*size_z);
                 bytes.extend_from_slice(&(compressed_data.len() as i32).to_be_bytes());
                 bytes.extend_from_slice(compressed_data);
+            }
+            ServerPacket::ChatMessage(message) => {
+                bytes.push(packet_ids::CHAT_MESSAGE);
+                write_utf16_string(&mut bytes, message);
             }
         }
 
