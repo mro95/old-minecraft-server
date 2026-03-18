@@ -11,9 +11,12 @@ use crate::{PlayerRegistry, packets::ServerPacket};
 
 pub struct Player {
     socket: Arc<Mutex<OwnedWriteHalf>>,
+    peer_addr: SocketAddr,
+
     username: Option<String>,
-    entity_id: Option<i32>,
-    position: (f64, f64, f64),
+    pub entity_id: Option<i32>,
+    pub position: (f64, f64, f64),
+    pub rotation: (f32, f32), // yaw, pitch
 
     pub pending_keepalive: HashMap<i32, std::time::Instant>, // keep-alive ID -> timestamp when sent
     pub last_latency: Option<Duration>,
@@ -21,12 +24,14 @@ pub struct Player {
 }
 
 impl Player {
-    pub fn new(socket: Arc<Mutex<OwnedWriteHalf>>) -> Self {
+    pub fn new(socket: Arc<Mutex<OwnedWriteHalf>>, peer_addr: SocketAddr) -> Self {
         Player {
             socket,
+            peer_addr,
             username: None,
             entity_id: None,
             position: (0.0, 0.0, 0.0),
+            rotation: (0.0, 0.0),
 
             pending_keepalive: HashMap::new(),
             last_latency: None,
@@ -42,6 +47,33 @@ impl Player {
         tracing::debug!(packet = ?packet, hex = hex::encode(&bytes[..bytes.len().min(50)]), len = bytes.len(), "Sending packet");
         let mut socket = self.socket.lock().await;
         socket.write_all(&bytes).await?;
+        Ok(())
+    }
+
+    pub async fn broadcast_packet(
+        &self,
+        players: &PlayerRegistry,
+        packet: ServerPacket,
+        include_self: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let player_list = get_player_list(players).await;
+
+        for (addr, _, _) in player_list {
+            tracing::trace!(
+                target_address = %addr,
+                packet_type = ?packet,
+                 "Broadcasting packet to player"
+            );
+            if !include_self && addr == self.peer_addr {
+                continue;
+            }
+            let players_lock = players.read().await;
+            if let Some(player_arc) = players_lock.get(&addr) {
+                let mut player = player_arc.write().await;
+                player.send_packet(packet.clone()).await?;
+            }
+        }
+
         Ok(())
     }
 
@@ -115,23 +147,6 @@ pub async fn send_player_list_update(
                     ping: latency,
                 })
                 .await?;
-        }
-    }
-
-    Ok(())
-}
-
-pub async fn broadcast_packet(
-    players: &PlayerRegistry,
-    packet: ServerPacket,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let player_list = get_player_list(players).await;
-
-    for (addr, _, _) in player_list {
-        let players_lock = players.read().await;
-        if let Some(player_arc) = players_lock.get(&addr) {
-            let mut player = player_arc.write().await;
-            player.send_packet(packet.clone()).await?;
         }
     }
 

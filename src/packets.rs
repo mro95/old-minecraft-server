@@ -84,6 +84,7 @@ pub enum ServerPacket {
         y: i32,
         z: i32,
     },
+    // Force the client to update the player's position and look (e.g. after teleportation)
     PlayerPositionAndLook {
         x: f64,
         y: f64,
@@ -118,6 +119,44 @@ pub enum ServerPacket {
         y: i8,
         z: i32,
         block_id: u8,
+    },
+    NamedEntitySpawn {
+        entity_id: i32,
+        username: String,
+        x: i32,
+        y: i32,
+        z: i32,
+        yaw: u8,
+        pitch: u8,
+        current_item: i16,
+    },
+    Entity(i32),
+    EntityRelativeMove {
+        entity_id: i32,
+        delta_x: u8,
+        delta_y: u8,
+        delta_z: u8,
+    },
+    EntityLook {
+        entity_id: i32,
+        yaw: u8,
+        pitch: u8,
+    },
+    EntityLookAndRelativeMove {
+        entity_id: i32,
+        delta_x: u8,
+        delta_y: u8,
+        delta_z: u8,
+        yaw: u8,
+        pitch: u8,
+    },
+    EntityTeleport {
+        entity_id: i32,
+        x: i32,
+        y: i32,
+        z: i32,
+        yaw: u8,
+        pitch: u8,
     },
 }
 
@@ -230,6 +269,84 @@ impl ServerPacket {
                 bytes.extend_from_slice(&z.to_be_bytes());
                 bytes.push(*block_id);
                 bytes.push(0); // metadata (nibble) - can be extended to include actual metadata if needed
+            }
+            ServerPacket::Entity(entity_id) => {
+                bytes.push(packet_ids::ENTITY);
+                bytes.extend_from_slice(&entity_id.to_be_bytes());
+            }
+            ServerPacket::EntityRelativeMove {
+                entity_id,
+                delta_x,
+                delta_y,
+                delta_z,
+            } => {
+                bytes.push(packet_ids::ENTITY_RELATIVE_MOVE);
+                bytes.extend_from_slice(&entity_id.to_be_bytes());
+                bytes.push(*delta_x);
+                bytes.push(*delta_y);
+                bytes.push(*delta_z);
+            }
+            ServerPacket::EntityLook {
+                entity_id,
+                yaw,
+                pitch,
+            } => {
+                bytes.push(packet_ids::ENTITY_LOOK);
+                bytes.extend_from_slice(&entity_id.to_be_bytes());
+                bytes.push(*yaw);
+                bytes.push(*pitch);
+            }
+            ServerPacket::EntityLookAndRelativeMove {
+                entity_id,
+                delta_x,
+                delta_y,
+                delta_z,
+                yaw,
+                pitch,
+            } => {
+                bytes.push(packet_ids::ENTITY_LOOK_AND_RELATIVE_MOVE);
+                bytes.extend_from_slice(&entity_id.to_be_bytes());
+                bytes.push(*delta_x);
+                bytes.push(*delta_y);
+                bytes.push(*delta_z);
+                bytes.push(*yaw);
+                bytes.push(*pitch);
+            }
+            ServerPacket::EntityTeleport {
+                entity_id,
+                x,
+                y,
+                z,
+                yaw,
+                pitch,
+            } => {
+                bytes.push(packet_ids::ENTITY_TELEPORT);
+                bytes.extend_from_slice(&entity_id.to_be_bytes());
+                bytes.extend_from_slice(&x.to_be_bytes());
+                bytes.extend_from_slice(&y.to_be_bytes());
+                bytes.extend_from_slice(&z.to_be_bytes());
+                bytes.push(*yaw);
+                bytes.push(*pitch);
+            }
+            ServerPacket::NamedEntitySpawn {
+                entity_id,
+                username,
+                x,
+                y,
+                z,
+                yaw,
+                pitch,
+                current_item,
+            } => {
+                bytes.push(packet_ids::NAMED_ENTITY_SPAWN);
+                bytes.extend_from_slice(&entity_id.to_be_bytes());
+                write_utf16_string(&mut bytes, username);
+                bytes.extend_from_slice(&x.to_be_bytes());
+                bytes.extend_from_slice(&y.to_be_bytes());
+                bytes.extend_from_slice(&z.to_be_bytes());
+                bytes.push(*yaw);
+                bytes.push(*pitch);
+                bytes.extend_from_slice(&current_item.to_be_bytes());
             }
         }
 

@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
 
 use crate::packets::{ClientPacket, ServerPacket};
-use crate::player::{Player, broadcast_packet};
+use crate::player::Player;
 use crate::world;
 use crate::{PlayerRegistry, protocol};
 
@@ -29,12 +29,12 @@ pub async fn handle_connection(
     let (mut read_half, write_half) = socket.into_split();
     let write_half = Arc::new(Mutex::new(write_half));
 
-    let player = Player::new(write_half.clone());
+    let player = Player::new(write_half.clone(), read_half.peer_addr()?);
     let player = Arc::new(RwLock::new(player));
     players
         .write()
         .await
-        .insert(write_half.lock().await.peer_addr()?, Arc::clone(&player));
+        .insert(read_half.peer_addr()?, Arc::clone(&player));
 
     let mut buffer = BytesMut::with_capacity(1024);
     let mut read_buf = [0u8; 1024];
@@ -190,16 +190,20 @@ async fn handle_packet(
         }
         ClientPacket::ChatMessage(message) => {
             info!(message = %message, "Chat message received");
-
-            broadcast_packet(
-                &players,
-                ServerPacket::ChatMessage(format!(
-                    "{}: {}",
-                    player.read().await.get_username().unwrap_or_default(),
-                    message
-                )),
-            )
-            .await?;
+            {
+                let player = player.read().await;
+                player
+                    .broadcast_packet(
+                        &players,
+                        ServerPacket::ChatMessage(format!(
+                            "{}: {}",
+                            player.get_username().unwrap_or_default(),
+                            message
+                        )),
+                        true,
+                    )
+                    .await?;
+            }
         }
         ClientPacket::Player { on_ground } => {
             debug!(on_ground, "Player on-ground status update");
@@ -233,6 +237,30 @@ async fn handle_packet(
                 x,
                 y, stance, z, yaw, pitch, on_ground, "Player position and look update"
             );
+
+            {
+                let mut player = player.write().await;
+                player.position = (x, y, z);
+                player.rotation = (yaw, pitch);
+            }
+
+            // Broadcast the player's new position and look to all other players
+            player
+                .read()
+                .await
+                .broadcast_packet(
+                    &players,
+                    ServerPacket::EntityTeleport {
+                        entity_id: player.read().await.entity_id.unwrap_or(0),
+                        x: (x * 32.0) as i32,
+                        y: (y * 32.0) as i32,
+                        z: (z * 32.0) as i32,
+                        yaw: (yaw * 256.0 / 360.0) as u8,
+                        pitch: (pitch * 256.0 / 360.0) as u8,
+                    },
+                    false, // Don't include self in broadcast
+                )
+                .await?;
         }
         ClientPacket::PlayerDigging {
             status,
@@ -385,6 +413,27 @@ async fn handle_login(
             pitch: 0.0,
             on_ground: false,
         })
+        .await?;
+
+    player.write().await.entity_id = Some(rand::random::<i32>());
+
+    player
+        .read()
+        .await
+        .broadcast_packet(
+            &players,
+            ServerPacket::NamedEntitySpawn {
+                entity_id: player.read().await.entity_id.unwrap_or(0),
+                username: player.read().await.get_username().unwrap_or_default(),
+                x: 0,
+                y: 64,
+                z: 0,
+                yaw: 0,
+                pitch: 0,
+                current_item: 0,
+            },
+            false, // Don't include self in broadcast
+        )
         .await?;
 
     info!("Login sequence complete");
