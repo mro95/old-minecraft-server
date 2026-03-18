@@ -15,5 +15,7 @@ pub const ANIMATION: u8 = 0x12;
 pub const ENTITY_ACTION: u8 = 0x13;
 pub const PRE_CHUNK: u8 = 0x32;
 pub const MAP_CHUNK: u8 = 0x33;
+pub const MULTI_BLOCK_CHANGE: u8 = 0x34;
+pub const BLOCK_CHANGE: u8 = 0x35;
 pub const PLAYER_LIST_ITEM: u8 = 0xC9;
 pub const DISCONNECT: u8 = 0xFF;

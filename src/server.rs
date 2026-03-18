@@ -238,7 +238,23 @@ async fn handle_packet(
             face,
         } => {
             debug!(status, x, y, z, face, "Player digging");
-            // TODO: Handle block breaking
+
+            // Status: 0=start digging, 1=cancel digging, 2=finish digging, 4=drop item, 5=shoot arrow
+
+            if status == 0 {
+                // For simplicity, just send a block change to air immediately
+                let socket = player.read().await.get_socket();
+                send_packet(
+                    socket,
+                    ServerPacket::BlockChange {
+                        x,
+                        y,
+                        z,
+                        block_id: 0, // Air
+                    },
+                )
+                .await?;
+            }
         }
         ClientPacket::PlayerBlockPlacement {
             x,

@@ -113,6 +113,12 @@ pub enum ServerPacket {
         online: bool,
         ping: i16,
     },
+    BlockChange {
+        x: i32,
+        y: i8,
+        z: i32,
+        block_id: u8,
+    },
 }
 
 impl ServerPacket {
@@ -216,6 +222,14 @@ impl ServerPacket {
                 write_utf16_string(&mut bytes, username);
                 bytes.push(if *online { 1 } else { 0 });
                 bytes.extend_from_slice(&ping.to_be_bytes());
+            }
+            ServerPacket::BlockChange { x, y, z, block_id } => {
+                bytes.push(packet_ids::BLOCK_CHANGE);
+                bytes.extend_from_slice(&x.to_be_bytes());
+                bytes.push(*y as u8);
+                bytes.extend_from_slice(&z.to_be_bytes());
+                bytes.push(*block_id);
+                bytes.push(0); // metadata (nibble) - can be extended to include actual metadata if needed
             }
         }
 
