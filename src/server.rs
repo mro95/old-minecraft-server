@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,8 +10,8 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::packets::{ClientPacket, ServerPacket};
 use crate::player::Player;
-use crate::{PlayerRegistry, protocol};
 use crate::world;
+use crate::{PlayerRegistry, protocol};
 
 const CHUNK_SIZE_X: u8 = 16;
 const CHUNK_SIZE_Y: u8 = 128;
@@ -19,7 +19,10 @@ const CHUNK_SIZE_Z: u8 = 16;
 
 /// Handle an incoming client connection
 #[instrument(skip(socket, players))]
-pub async fn handle_connection(socket: TcpStream, players: PlayerRegistry) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn handle_connection(
+    socket: TcpStream,
+    players: PlayerRegistry,
+) -> Result<(), Box<dyn std::error::Error>> {
     socket.set_nodelay(true)?; // Disable Nagle's algorithm for lower latency
     info!("Connection established");
 
@@ -28,7 +31,10 @@ pub async fn handle_connection(socket: TcpStream, players: PlayerRegistry) -> Re
 
     let player = Player::new(write_half.clone());
     let player = Arc::new(RwLock::new(player));
-    players.write().await.insert(write_half.lock().await.peer_addr()?, Arc::clone(&player));
+    players
+        .write()
+        .await
+        .insert(write_half.lock().await.peer_addr()?, Arc::clone(&player));
 
     let mut buffer = BytesMut::with_capacity(1024);
     let mut read_buf = [0u8; 1024];
@@ -45,7 +51,10 @@ pub async fn handle_connection(socket: TcpStream, players: PlayerRegistry) -> Re
                 let mut player_tick = player_tick.write().await;
                 let keepalive_id = player_tick.start_latency_measurement();
 
-                if let Err(e) = player_tick.send_packet(ServerPacket::KeepAlive(keepalive_id)).await {
+                if let Err(e) = player_tick
+                    .send_packet(ServerPacket::KeepAlive(keepalive_id))
+                    .await
+                {
                     debug!(error = %e, "Failed to send keep-alive, connection likely closed");
                     player_tick.pending_keepalive.remove(&keepalive_id); // Clean up if send failed
                     break; // Exit task on error (e.g. connection closed)
@@ -56,9 +65,11 @@ pub async fn handle_connection(socket: TcpStream, players: PlayerRegistry) -> Re
             if tick.elapsed().as_secs() % 5 == 0 {
                 let player_list = crate::player::get_player_list(&players_tick).await;
                 info!(player_count = player_list.len(), "Current player list");
-                crate::player::send_player_list_update(&players_tick).await.unwrap_or_else(|e| {
-                    debug!(error = %e, "Failed to send player list update");
-                });
+                crate::player::send_player_list_update(&players_tick)
+                    .await
+                    .unwrap_or_else(|e| {
+                        debug!(error = %e, "Failed to send player list update");
+                    });
             }
         }
     });
@@ -75,23 +86,28 @@ pub async fn handle_connection(socket: TcpStream, players: PlayerRegistry) -> Re
         }
 
         buffer.extend_from_slice(&read_buf[..n]);
-        
+
         // Log what we just read AND the total buffer state
         if n > 0 {
-            debug!(bytes_read = n, 
-                   read_hex = hex::encode(&read_buf[..n.min(50)]),
-                   buffer_total = buffer.len(),
-                   buffer_start = hex::encode(&buffer.chunk()[..buffer.len().min(10)]),
-                   "Read from socket");
+            debug!(
+                bytes_read = n,
+                read_hex = hex::encode(&read_buf[..n.min(50)]),
+                buffer_total = buffer.len(),
+                buffer_start = hex::encode(&buffer.chunk()[..buffer.len().min(10)]),
+                "Read from socket"
+            );
         }
 
         while !buffer.is_empty() {
             match protocol::parse_packet(&buffer) {
                 Ok((remaining, packet)) => {
                     let consumed = buffer.len() - remaining.len();
-                    debug!(?packet, consumed_bytes = consumed, 
-                           packet_id = format!("0x{:02X}", buffer.chunk()[0]),
-                           "Parsed packet");
+                    debug!(
+                        ?packet,
+                        consumed_bytes = consumed,
+                        packet_id = format!("0x{:02X}", buffer.chunk()[0]),
+                        "Parsed packet"
+                    );
 
                     buffer.advance(consumed);
 
@@ -110,7 +126,7 @@ pub async fn handle_connection(socket: TcpStream, players: PlayerRegistry) -> Re
                     } else {
                         "empty".to_string()
                     };
-                    
+
                     warn!(
                         error = ?e,
                         buffer_len = buffer.len(),
@@ -135,19 +151,26 @@ async fn handle_packet(
     match packet {
         ClientPacket::KeepAlive(value) => {
             info!(value, "Keep alive received from client");
-            
+
             let mut player = player.write().await;
             if let Some(pending) = player.pending_keepalive.remove(&value) {
                 let latency = pending.elapsed().as_millis() as i16;
                 player.last_latency = Some(Duration::from_millis(latency as u64));
-                info!(latency_ms = latency, "Keep-alive response received, latency updated");
+                info!(
+                    latency_ms = latency,
+                    "Keep-alive response received, latency updated"
+                );
             } else {
                 info!("Received unexpected keep-alive value: {}, ignoring", value);
             }
         }
         ClientPacket::Handshake(username) => {
             info!(username = %username, "Handshake received");
-            player.write().await.send_packet(ServerPacket::Handshake("-".to_string())).await?;
+            player
+                .write()
+                .await
+                .send_packet(ServerPacket::Handshake("-".to_string()))
+                .await?;
         }
         ClientPacket::LoginRequest {
             protocol_version,
@@ -167,10 +190,12 @@ async fn handle_packet(
         }
         ClientPacket::ChatMessage(message) => {
             info!(message = %message, "Chat message received");
-            
-            player.write().await.send_packet(
-                ServerPacket::ChatMessage(format!("Echo: {}", message))
-            ).await?;
+
+            player
+                .write()
+                .await
+                .send_packet(ServerPacket::ChatMessage(format!("Echo: {}", message)))
+                .await?;
         }
         ClientPacket::Player { on_ground } => {
             debug!(on_ground, "Player on-ground status update");
@@ -201,8 +226,8 @@ async fn handle_packet(
             on_ground,
         } => {
             debug!(
-                x, y, stance, z, yaw, pitch, on_ground,
-                "Player position and look update"
+                x,
+                y, stance, z, yaw, pitch, on_ground, "Player position and look update"
             );
         }
         ClientPacket::PlayerDigging {
@@ -242,7 +267,15 @@ async fn handle_packet(
             info!(reason = %reason, "Client disconnect");
             // Clean up player from registry
             let mut players_lock = players.write().await;
-            if let Some(addr) = player.read().await.get_socket().lock().await.peer_addr().ok() {
+            if let Some(addr) = player
+                .read()
+                .await
+                .get_socket()
+                .lock()
+                .await
+                .peer_addr()
+                .ok()
+            {
                 players_lock.remove(&addr);
                 info!(address = %addr, "Player removed from registry");
             } else {
@@ -250,7 +283,14 @@ async fn handle_packet(
             }
 
             // Close socket by dropping write half
-            player.write().await.get_socket().lock().await.shutdown().await?;
+            player
+                .write()
+                .await
+                .get_socket()
+                .lock()
+                .await
+                .shutdown()
+                .await?;
 
             return Err("Client disconnected".into());
         }
@@ -272,12 +312,17 @@ async fn send_packet(
 
 /// Handle login sequence for a new player
 #[instrument(skip(player, players))]
-async fn handle_login(player: Arc<RwLock<Player>>, players: PlayerRegistry) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_login(
+    player: Arc<RwLock<Player>>,
+    players: PlayerRegistry,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting login sequence");
 
     // Send login response
-    player.write().await.send_packet(
-        ServerPacket::LoginResponse {
+    player
+        .write()
+        .await
+        .send_packet(ServerPacket::LoginResponse {
             entity_id: 1,
             level_type: "".to_string(),
             map_seed: 1234,
@@ -286,19 +331,15 @@ async fn handle_login(player: Arc<RwLock<Player>>, players: PlayerRegistry) -> R
             difficulty: 1,
             world_height: 127,
             max_players: 20,
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     // Send spawn position first
-    player.write().await.send_packet(
-        ServerPacket::SpawnPosition {
-            x: 0,
-            y: 64,
-            z: 0,
-        },
-    )
-    .await?;
+    player
+        .write()
+        .await
+        .send_packet(ServerPacket::SpawnPosition { x: 0, y: 64, z: 0 })
+        .await?;
 
     // IMPORTANT: Send chunks BEFORE player position
     // Send a small 3x3 plain of chunks around spawn
@@ -312,8 +353,10 @@ async fn handle_login(player: Arc<RwLock<Player>>, players: PlayerRegistry) -> R
     info!("All chunks sent");
 
     // Now send player position after chunks are loaded
-    player.write().await.send_packet(
-        ServerPacket::PlayerPositionAndLook {
+    player
+        .write()
+        .await
+        .send_packet(ServerPacket::PlayerPositionAndLook {
             x: 0.5,
             y: 65.0,
             stance: 66.62, // Y + 1.62 (eye height)
@@ -321,9 +364,8 @@ async fn handle_login(player: Arc<RwLock<Player>>, players: PlayerRegistry) -> R
             yaw: 0.0,
             pitch: 0.0,
             on_ground: false,
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     info!("Login sequence complete");
     Ok(())
@@ -341,7 +383,12 @@ async fn send_grass_chunk(
     let expected_total = (blocks as f32 * 2.5) as usize;
 
     // Generate terrain data
-    let data = world::generate_grass_plain_chunk(CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z);
+    let data = world::generate_perlin_noise_chunk(
+        CHUNK_SIZE_X,
+        CHUNK_SIZE_Y,
+        CHUNK_SIZE_Z,
+        781378172 + chunk_x as u32 * 348712 + chunk_z as u32 * 7987541,
+    );
 
     debug!(
         chunk_x,
@@ -381,9 +428,9 @@ async fn send_grass_chunk(
     send_packet(
         socket.clone(),
         ServerPacket::MapChunk {
-            x: chunk_x * 16,      // Convert chunk coord to block coord
-            y: 0,                 // Start from bedrock
-            z: chunk_z * 16,      // Convert chunk coord to block coord
+            x: chunk_x * 16,          // Convert chunk coord to block coord
+            y: 0,                     // Start from bedrock
+            z: chunk_z * 16,          // Convert chunk coord to block coord
             size_x: CHUNK_SIZE_X - 1, // 15 (actual size 16)
             size_y: CHUNK_SIZE_Y - 1, // 127 (actual size 128)
             size_z: CHUNK_SIZE_Z - 1, // 15 (actual size 16)

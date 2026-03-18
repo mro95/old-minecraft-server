@@ -1,5 +1,5 @@
-use nom::bytes::streaming::take;
 use nom::IResult;
+use nom::bytes::streaming::take;
 
 use crate::packet_ids;
 use crate::packets::ClientPacket;
@@ -82,7 +82,7 @@ pub fn parse_packet(input: &[u8]) -> IResult<&[u8], ClientPacket> {
             let (input, username) = parse_utf16_string(input)?;
             let (input, map_seed) = parse_i64(input)?;
             let (input, dimension) = take(1usize)(input)?;
-            
+
             // Modern protocol (Beta 1.8+) may have additional fields
             // Try to consume them if present: game_mode (i32), dimension (i8), difficulty (i8), world_height (u8), max_players (u8)
             // For compatibility, consume remaining bytes if available (some clients send extra data)

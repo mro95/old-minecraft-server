@@ -1,9 +1,9 @@
 mod packet_ids;
 mod packets;
+mod player;
 mod protocol;
 mod server;
 mod world;
-mod player;
 
 use std::{collections::HashMap, sync::Arc};
 
