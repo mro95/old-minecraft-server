@@ -7,7 +7,7 @@ use std::{
 
 use tokio::{io::AsyncWriteExt as _, net::tcp::OwnedWriteHalf, sync::Mutex};
 
-use crate::{PlayerRegistry, packets::ServerPacket};
+use crate::{PlayerRegistry, packets::ServerPacket, Result};
 
 pub struct Player {
     socket: Arc<Mutex<OwnedWriteHalf>>,
@@ -42,9 +42,9 @@ impl Player {
     pub async fn send_packet(
         &mut self,
         packet: ServerPacket,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<()> {
         let bytes = packet.to_bytes();
-        tracing::debug!(packet = ?packet, hex = hex::encode(&bytes[..bytes.len().min(50)]), len = bytes.len(), "Sending packet");
+        tracing::info!(packet = ?packet, hex = hex::encode(&bytes), len = bytes.len(), "Sending packet");
         let mut socket = self.socket.lock().await;
         socket.write_all(&bytes).await?;
         Ok(())
@@ -55,25 +55,37 @@ impl Player {
         players: &PlayerRegistry,
         packet: ServerPacket,
         include_self: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<()> {
         let player_list = get_player_list(players).await;
+        let bytes = packet.to_bytes();
 
         for (addr, _, _) in player_list {
-            tracing::trace!(
+            tracing::debug!(
                 target_address = %addr,
-                packet_type = ?packet,
-                 "Broadcasting packet to player"
+                self_addr = %self.peer_addr,
+                include_self,
+                "Broadcasting packet"
             );
             if !include_self && addr == self.peer_addr {
+                tracing::debug!("Skipping self in broadcast");
                 continue;
             }
             let players_lock = players.read().await;
             if let Some(player_arc) = players_lock.get(&addr) {
+                tracing::debug!("Sending packet to {}", addr);
                 let mut player = player_arc.write().await;
-                player.send_packet(packet.clone()).await?;
+                player.send_bytes(&bytes).await?;
+            } else {
+                tracing::warn!("Player {} not found in registry", addr);
             }
         }
 
+        Ok(())
+    }
+
+    pub async fn send_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        let mut socket = self.socket.lock().await;
+        socket.write_all(bytes).await?;
         Ok(())
     }
 
@@ -113,10 +125,14 @@ pub async fn get_player_list(players: &PlayerRegistry) -> Vec<(SocketAddr, Strin
     for (addr, player_arc) in players_lock.iter() {
         let player = player_arc.read().await;
         if let Some(username) = &player.username {
+            tracing::trace!(addr = %addr, username = %username, entity_id = ?player.entity_id, "Found player in registry");
             player_list.push((*addr, username.clone(), player.entity_id));
+        } else {
+            tracing::trace!(addr = %addr, "Player has no username yet");
         }
     }
 
+    tracing::debug!(count = player_list.len(), "get_player_list returning");
     player_list
 }
 
@@ -132,7 +148,7 @@ pub async fn print_player_list(players: &PlayerRegistry) {
 
 pub async fn send_player_list_update(
     players: &PlayerRegistry,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<()> {
     let player_list = get_player_list(players).await;
 
     for (addr, username, _) in player_list {

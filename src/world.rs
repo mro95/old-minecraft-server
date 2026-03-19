@@ -1,4 +1,17 @@
+use thiserror::Error;
 use tracing::{debug, warn};
+
+#[derive(Error, Debug)]
+pub enum WorldError {
+    #[error("Compression failed: {0}")]
+    CompressionFailed(String),
+}
+
+impl From<String> for WorldError {
+    fn from(s: String) -> Self {
+        WorldError::CompressionFailed(s)
+    }
+}
 
 // Block IDs
 const AIR: u8 = 0;
@@ -95,7 +108,7 @@ pub fn generate_grass_plain_chunk(size_x: u8, size_y: u8, size_z: u8) -> Vec<u8>
 /// # Panics
 /// Panics if any dimension is zero or greater than 256 (arbitrary safety limit).
 pub fn generate_perlin_noise_chunk(size_x: u8, size_y: u8, size_z: u8, seed: u32) -> Vec<u8> {
-    use noise::{Fbm, NoiseFn, Perlin, Seedable};
+    use noise::{Fbm, NoiseFn, Perlin};
 
     // Validate dimensions (optional but recommended)
     assert!(
@@ -130,8 +143,8 @@ pub fn generate_perlin_noise_chunk(size_x: u8, size_y: u8, size_z: u8, seed: u32
     // Height range control – avoids extreme mountains and pits.
     const BASE_HEIGHT: f64 = 64.0; // Average ground level
     const HEIGHT_AMP: f64 = 24.0; // Max deviation from base (so terrain 40–88 typically)
-    // Noise range for FBM with default settings is roughly [-1, 1], but can exceed.
-    // We'll clamp final height to safe bounds.
+                                  // Noise range for FBM with default settings is roughly [-1, 1], but can exceed.
+                                  // We'll clamp final height to safe bounds.
 
     // Cave threshold: noise values below -threshold become air.
     const CAVE_THRESHOLD: f64 = 0.15; // Lower = more caves
@@ -213,7 +226,7 @@ pub fn verify_zlib_format(data: &[u8]) -> bool {
 }
 
 /// Compress chunk data using zlib format
-pub fn compress_chunk_data(data: &[u8]) -> Result<Vec<u8>, String> {
+pub fn compress_chunk_data(data: &[u8]) -> Result<Vec<u8>, WorldError> {
     // Allocate enough space for compressed data
     let mut compress_buffer = vec![0u8; data.len() * 2];
     let (compressed_slice, status) = zlib_rs::compress_slice(
@@ -224,7 +237,7 @@ pub fn compress_chunk_data(data: &[u8]) -> Result<Vec<u8>, String> {
 
     // Check compression status
     if status != zlib_rs::ReturnCode::Ok {
-        return Err(format!("Compression failed with status: {:?}", status));
+        return Err(format!("Compression failed with status: {:?}", status).into());
     }
 
     // Copy the compressed data

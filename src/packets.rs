@@ -196,7 +196,12 @@ impl ServerPacket {
                 bytes.extend_from_slice(&map_seed.to_be_bytes());
 
                 bytes.extend_from_slice(&game_mode.to_be_bytes());
-                bytes.extend_from_slice(&[*dimension, *difficulty, *world_height as u8, *max_players as u8]);
+                bytes.extend_from_slice(&[
+                    *dimension,
+                    *difficulty,
+                    *world_height as u8,
+                    *max_players as u8,
+                ]);
             }
             ServerPacket::SpawnPosition { x, y, z } => {
                 bytes.extend_from_slice(&[packet_ids::SPAWN_POSITION]);

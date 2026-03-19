@@ -11,7 +11,7 @@ use tracing::{debug, info, instrument, warn};
 use crate::packets::{ClientPacket, ServerPacket};
 use crate::player::Player;
 use crate::world;
-use crate::{PlayerRegistry, protocol};
+use crate::{PlayerRegistry, protocol, Result, ServerError};
 
 const CHUNK_SIZE_X: u8 = 16;
 const CHUNK_SIZE_Y: u8 = 128;
@@ -22,24 +22,18 @@ const CHUNK_SIZE_Z: u8 = 16;
 pub async fn handle_connection(
     socket: TcpStream,
     players: PlayerRegistry,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<()> {
     socket.set_nodelay(true)?; // Disable Nagle's algorithm for lower latency
     info!("Connection established");
 
     let (mut read_half, write_half) = socket.into_split();
     let write_half = Arc::new(Mutex::new(write_half));
+    let peer_addr = read_half.peer_addr()?;
 
-    let player = Player::new(write_half.clone(), read_half.peer_addr()?);
+    let player = Player::new(write_half.clone(), peer_addr);
     let player = Arc::new(RwLock::new(player));
-    players
-        .write()
-        .await
-        .insert(read_half.peer_addr()?, Arc::clone(&player));
 
-    let mut buffer = BytesMut::with_capacity(1024);
-    let mut read_buf = [0u8; 1024];
-
-    // Spawn keep-alive task
+    // Spawn keep-alive task before registration
     let players_tick = Arc::clone(&players);
     let player_tick = Arc::clone(&player);
     let keep_alive_task = tokio::spawn(async move {
@@ -73,6 +67,9 @@ pub async fn handle_connection(
             }
         }
     });
+
+    let mut buffer = BytesMut::with_capacity(1024);
+    let mut read_buf = [0u8; 1024];
 
     loop {
         let n = {
@@ -147,7 +144,7 @@ async fn handle_packet(
     packet: ClientPacket,
     player: Arc<RwLock<Player>>,
     players: PlayerRegistry,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<()> {
     match packet {
         ClientPacket::KeepAlive(value) => {
             info!(value, "Keep alive received from client");
@@ -360,7 +357,7 @@ async fn handle_packet(
                 .shutdown()
                 .await?;
 
-            return Err("Client disconnected".into());
+            return Err(ServerError::ConnectionClosed);
         }
     }
     Ok(())
@@ -371,7 +368,7 @@ async fn handle_packet(
 async fn send_packet(
     socket: Arc<Mutex<OwnedWriteHalf>>,
     packet: ServerPacket,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<()> {
     let bytes = packet.to_bytes();
     socket.lock().await.write_all(&bytes).await?;
     debug!(size = bytes.len(), "Sent packet");
@@ -383,8 +380,10 @@ async fn send_packet(
 async fn handle_login(
     player: Arc<RwLock<Player>>,
     players: PlayerRegistry,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<()> {
     info!("Starting login sequence");
+
+    let peer_addr = player.read().await.peer_addr;
 
     // Send login response
     player
@@ -410,78 +409,90 @@ async fn handle_login(
         .await?;
 
     // IMPORTANT: Send chunks BEFORE player position
-    // Send a small 3x3 plain of chunks around spawn
-    info!("Sending chunks");
+    // First send all PreChunk packets so client prepares chunk slots
+    let socket = player.read().await.get_socket();
+    info!("Sending pre-chunks");
     for cz in -1..=1 {
         for cx in -1..=1 {
-            let socket = player.read().await.get_socket();
-            send_grass_chunk(socket, cx, cz).await?;
+            send_packet(
+                socket.clone(),
+                ServerPacket::PreChunk {
+                    x: cx,
+                    z: cz,
+                    mode: true,
+                },
+            )
+            .await?;
+        }
+    }
+
+    // Now send all MapChunk data
+    info!("Sending map chunks");
+    for cz in -1..=1 {
+        for cx in -1..=1 {
+            send_grass_chunk(socket.clone(), cx, cz).await?;
         }
     }
     info!("All chunks sent");
 
     // Now send player position after chunks are loaded
+    const SPAWN_X: f64 = 0.5;
+    const SPAWN_Y: f64 = 65.0;
+    const SPAWN_Z: f64 = 0.5;
+
     player
         .write()
         .await
         .send_packet(ServerPacket::PlayerPositionAndLook {
-            x: 0.5,
-            y: 65.0,
-            stance: 66.62, // Y + 1.62 (eye height)
-            z: 0.5,
+            x: SPAWN_X,
+            y: SPAWN_Y,
+            stance: 66.62,
+            z: SPAWN_Z,
             yaw: 0.0,
             pitch: 0.0,
             on_ground: false,
         })
         .await?;
 
-    player.write().await.entity_id = Some(rand::random::<i32>());
-
-    // Show other players that this new player has spawned
-    player
-        .read()
-        .await
-        .broadcast_packet(
-            &players,
-            ServerPacket::NamedEntitySpawn {
-                entity_id: player.read().await.entity_id.unwrap_or(0),
-                username: player.read().await.get_username().unwrap_or_default(),
-                x: 0,
-                y: 64,
-                z: 0,
-                yaw: 0,
-                pitch: 0,
-                current_item: 0,
-            },
-            false, // Don't include self in broadcast
-        )
-        .await?;
+    let (entity_id, username, peer_addr) = {
+        let mut player_write = player.write().await;
+        let entity_id = rand::random::<i32>();
+        player_write.entity_id = Some(entity_id);
+        player_write.position = (SPAWN_X, SPAWN_Y, SPAWN_Z);
+        (entity_id, player_write.get_username().unwrap_or_default(), player_write.peer_addr)
+    };
 
     // Create entity spawn packets for existing players to show them to the new player
     let player_list = crate::player::get_player_list(&players).await;
-    for (addr, username, entity_id) in player_list {
-        if addr == player.read().await.peer_addr {
-            continue; // Skip self
+    info!(player_count = player_list.len(), "Existing players to spawn for new player");
+    for (addr, other_username, other_entity_id) in player_list {
+        if addr == peer_addr {
+            info!("Skipping self");
+            continue;
         }
 
         let (x, y, z) = {
             let players_lock = players.read().await;
             if let Some(other_player) = players_lock.get(&addr) {
-                other_player.read().await.position
+                let p = other_player.read().await;
+                info!(addr = %addr, username = %other_username, entity_id = ?other_entity_id, pos = ?p.position, "Existing player data");
+                (p.position.0 as i32, p.position.1 as i32, p.position.2 as i32)
             } else {
-                (0.0, 64.0, 0.0) // Default position if player not found (shouldn't happen)
+                info!("Player not found in registry");
+                (0, 64, 0)
             }
         };
 
+        info!(username = %other_username, entity_id = ?other_entity_id, x, y, z, "Sending NamedEntitySpawn to new player");
         player
             .write()
             .await
             .send_packet(ServerPacket::NamedEntitySpawn {
-                entity_id: entity_id.unwrap_or(0),
-                username,
-                x: x as i32,
-                y: y as i32,
-                z: z as i32,
+                entity_id: other_entity_id.unwrap_or(0),
+                username: other_username,
+                x,
+                y,
+                z,
                 yaw: 0,
                 pitch: 0,
                 current_item: 0,
@@ -489,17 +500,46 @@ async fn handle_login(
             .await?;
     }
 
-    info!("Login sequence complete");
+    // Add player to registry AFTER all data is set (entity_id, username, position)
+    // This ensures other players see fully initialized player data
+    info!("Adding player to registry");
+    players.write().await.insert(peer_addr, Arc::clone(&player));
+
+    // Now broadcast this player's spawn to all existing players
+    info!(username = %username, entity_id, x = SPAWN_X as i32, y = SPAWN_Y as i32, z = SPAWN_Z as i32, "Broadcasting player spawn");
+    let (entity_id, username) = {
+        let p = player.read().await;
+        (p.entity_id.unwrap_or(0), p.get_username().unwrap_or_default())
+    };
+    player
+        .read()
+        .await
+        .broadcast_packet(
+            &players,
+            ServerPacket::NamedEntitySpawn {
+                entity_id,
+                username,
+                x: SPAWN_X as i32,
+                y: SPAWN_Y as i32,
+                z: SPAWN_Z as i32,
+                yaw: 0,
+                pitch: 0,
+                current_item: 0,
+            },
+            false,
+        )
+        .await?;
+
     Ok(())
 }
 
-/// Send a grass plain chunk to the client
+/// Send a grass plain chunk to the client (only MapChunk, PreChunk sent separately)
 #[instrument(skip(socket))]
 async fn send_grass_chunk(
     socket: Arc<Mutex<OwnedWriteHalf>>,
     chunk_x: i32,
     chunk_z: i32,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<()> {
     // Calculate expected size per spec: (Size_X+1) * (Size_Y+1) * (Size_Z+1) * 2.5
     let blocks = (CHUNK_SIZE_X as usize) * (CHUNK_SIZE_Y as usize) * (CHUNK_SIZE_Z as usize);
     let expected_total = (blocks as f32 * 2.5) as usize;
@@ -532,17 +572,6 @@ async fn send_grass_chunk(
     } else {
         warn!("Invalid compression format - Minecraft may reject this chunk");
     }
-
-    // Send pre-chunk packet (0x32)
-    send_packet(
-        socket.clone(),
-        ServerPacket::PreChunk {
-            x: chunk_x,
-            z: chunk_z,
-            mode: true,
-        },
-    )
-    .await?;
 
     // Send chunk data (0x33)
     // Per spec: X, Y, Z are BLOCK coordinates (not chunk)

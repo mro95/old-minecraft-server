@@ -1,9 +1,12 @@
+mod errors;
 mod packet_ids;
 mod packets;
 mod player;
 mod protocol;
 mod server;
 mod world;
+
+pub use errors::{ServerError, Result};
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -16,7 +19,7 @@ use crate::player::Player;
 type PlayerRegistry = Arc<RwLock<HashMap<std::net::SocketAddr, Arc<RwLock<Player>>>>>;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> crate::Result<()> {
     // Initialize tracing subscriber
     tracing_subscriber::registry()
         .with(
