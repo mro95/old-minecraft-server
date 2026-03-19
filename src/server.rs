@@ -223,6 +223,26 @@ async fn handle_packet(
             on_ground,
         } => {
             debug!(yaw, pitch, on_ground, "Player look update");
+
+            {
+                let mut player = player.write().await;
+                player.rotation = (yaw, pitch);
+            }
+
+            // Broadcast the player's new look to all other players
+            player
+                .read()
+                .await
+                .broadcast_packet(
+                    &players,
+                    ServerPacket::EntityLook {
+                        entity_id: player.read().await.entity_id.unwrap_or(0),
+                        yaw: (yaw * 256.0 / 360.0) as u8,
+                        pitch: (pitch * 256.0 / 360.0) as u8,
+                    },
+                    false, // Don't include self in broadcast
+                )
+                .await?;
         }
         ClientPacket::PlayerPositionAndLook {
             x,
@@ -417,6 +437,7 @@ async fn handle_login(
 
     player.write().await.entity_id = Some(rand::random::<i32>());
 
+    // Show other players that this new player has spawned
     player
         .read()
         .await
@@ -435,6 +456,38 @@ async fn handle_login(
             false, // Don't include self in broadcast
         )
         .await?;
+
+    // Create entity spawn packets for existing players to show them to the new player
+    let player_list = crate::player::get_player_list(&players).await;
+    for (addr, username, entity_id) in player_list {
+        if addr == player.read().await.peer_addr {
+            continue; // Skip self
+        }
+
+        let (x, y, z) = {
+            let players_lock = players.read().await;
+            if let Some(other_player) = players_lock.get(&addr) {
+                other_player.read().await.position
+            } else {
+                (0.0, 64.0, 0.0) // Default position if player not found (shouldn't happen)
+            }
+        };
+
+        player
+            .write()
+            .await
+            .send_packet(ServerPacket::NamedEntitySpawn {
+                entity_id: entity_id.unwrap_or(0),
+                username,
+                x: x as i32,
+                y: y as i32,
+                z: z as i32,
+                yaw: 0,
+                pitch: 0,
+                current_item: 0,
+            })
+            .await?;
+    }
 
     info!("Login sequence complete");
     Ok(())

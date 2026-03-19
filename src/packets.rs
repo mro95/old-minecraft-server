@@ -1,3 +1,5 @@
+use bytes::BytesMut;
+
 use crate::packet_ids;
 
 /// Packets sent from the client to the server
@@ -162,16 +164,16 @@ pub enum ServerPacket {
 
 impl ServerPacket {
     /// Serialize packet to bytes for network transmission
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
+    pub fn to_bytes(&self) -> BytesMut {
+        let mut bytes = BytesMut::new();
 
         match self {
             ServerPacket::KeepAlive(value) => {
-                bytes.push(packet_ids::KEEP_ALIVE);
+                bytes.extend_from_slice(&[packet_ids::KEEP_ALIVE]);
                 bytes.extend_from_slice(&value.to_be_bytes());
             }
             ServerPacket::Handshake(hash) => {
-                bytes.push(packet_ids::HANDSHAKE);
+                bytes.extend_from_slice(&[packet_ids::HANDSHAKE]);
                 write_utf16_string(&mut bytes, hash);
             }
             ServerPacket::LoginResponse {
@@ -184,7 +186,7 @@ impl ServerPacket {
                 world_height,
                 max_players,
             } => {
-                bytes.push(packet_ids::LOGIN_REQUEST);
+                bytes.extend_from_slice(&[packet_ids::LOGIN_REQUEST]);
                 bytes.extend_from_slice(&entity_id.to_be_bytes());
 
                 // Write level type as UTF-16 string
@@ -194,13 +196,10 @@ impl ServerPacket {
                 bytes.extend_from_slice(&map_seed.to_be_bytes());
 
                 bytes.extend_from_slice(&game_mode.to_be_bytes());
-                bytes.push(*dimension);
-                bytes.push(*difficulty);
-                bytes.push(*world_height as u8);
-                bytes.push(*max_players as u8);
+                bytes.extend_from_slice(&[*dimension, *difficulty, *world_height as u8, *max_players as u8]);
             }
             ServerPacket::SpawnPosition { x, y, z } => {
-                bytes.push(packet_ids::SPAWN_POSITION);
+                bytes.extend_from_slice(&[packet_ids::SPAWN_POSITION]);
                 bytes.extend_from_slice(&x.to_be_bytes());
                 bytes.extend_from_slice(&y.to_be_bytes());
                 bytes.extend_from_slice(&z.to_be_bytes());
@@ -214,20 +213,20 @@ impl ServerPacket {
                 pitch,
                 on_ground,
             } => {
-                bytes.push(packet_ids::PLAYER_POSITION_AND_LOOK);
+                bytes.extend_from_slice(&[packet_ids::PLAYER_POSITION_AND_LOOK]);
                 bytes.extend_from_slice(&x.to_be_bytes());
                 bytes.extend_from_slice(&y.to_be_bytes());
                 bytes.extend_from_slice(&stance.to_be_bytes());
                 bytes.extend_from_slice(&z.to_be_bytes());
                 bytes.extend_from_slice(&yaw.to_be_bytes());
                 bytes.extend_from_slice(&pitch.to_be_bytes());
-                bytes.push(if *on_ground { 1 } else { 0 });
+                bytes.extend_from_slice(&[if *on_ground { 1 } else { 0 }]);
             }
             ServerPacket::PreChunk { x, z, mode } => {
-                bytes.push(packet_ids::PRE_CHUNK);
+                bytes.extend_from_slice(&[packet_ids::PRE_CHUNK]);
                 bytes.extend_from_slice(&x.to_be_bytes());
                 bytes.extend_from_slice(&z.to_be_bytes());
-                bytes.push(if *mode { 1 } else { 0 });
+                bytes.extend_from_slice(&[if *mode { 1 } else { 0 }]);
             }
             ServerPacket::MapChunk {
                 x,
@@ -238,18 +237,18 @@ impl ServerPacket {
                 size_z,
                 compressed_data,
             } => {
-                bytes.push(packet_ids::MAP_CHUNK);
+                bytes.extend_from_slice(&[packet_ids::MAP_CHUNK]);
                 bytes.extend_from_slice(&x.to_be_bytes());
                 bytes.extend_from_slice(&y.to_be_bytes());
                 bytes.extend_from_slice(&z.to_be_bytes());
-                bytes.push(*size_x);
-                bytes.push(*size_y);
-                bytes.push(*size_z);
+                bytes.extend_from_slice(&[*size_x]);
+                bytes.extend_from_slice(&[*size_y]);
+                bytes.extend_from_slice(&[*size_z]);
                 bytes.extend_from_slice(&(compressed_data.len() as i32).to_be_bytes());
                 bytes.extend_from_slice(compressed_data);
             }
             ServerPacket::ChatMessage(message) => {
-                bytes.push(packet_ids::CHAT_MESSAGE);
+                bytes.extend_from_slice(&[packet_ids::CHAT_MESSAGE]);
                 write_utf16_string(&mut bytes, message);
             }
             ServerPacket::PlayerListItem {
@@ -257,21 +256,21 @@ impl ServerPacket {
                 online,
                 ping,
             } => {
-                bytes.push(packet_ids::PLAYER_LIST_ITEM);
+                bytes.extend_from_slice(&[packet_ids::PLAYER_LIST_ITEM]);
                 write_utf16_string(&mut bytes, username);
-                bytes.push(if *online { 1 } else { 0 });
+                bytes.extend_from_slice(&[if *online { 1 } else { 0 }]);
                 bytes.extend_from_slice(&ping.to_be_bytes());
             }
             ServerPacket::BlockChange { x, y, z, block_id } => {
-                bytes.push(packet_ids::BLOCK_CHANGE);
+                bytes.extend_from_slice(&[packet_ids::BLOCK_CHANGE]);
                 bytes.extend_from_slice(&x.to_be_bytes());
-                bytes.push(*y as u8);
+                bytes.extend_from_slice(&[*y as u8]);
                 bytes.extend_from_slice(&z.to_be_bytes());
-                bytes.push(*block_id);
-                bytes.push(0); // metadata (nibble) - can be extended to include actual metadata if needed
+                bytes.extend_from_slice(&[*block_id]);
+                bytes.extend_from_slice(&[0]); // metadata (nibble) - can be extended to include actual metadata if needed
             }
             ServerPacket::Entity(entity_id) => {
-                bytes.push(packet_ids::ENTITY);
+                bytes.extend_from_slice(&[packet_ids::ENTITY]);
                 bytes.extend_from_slice(&entity_id.to_be_bytes());
             }
             ServerPacket::EntityRelativeMove {
@@ -280,21 +279,21 @@ impl ServerPacket {
                 delta_y,
                 delta_z,
             } => {
-                bytes.push(packet_ids::ENTITY_RELATIVE_MOVE);
+                bytes.extend_from_slice(&[packet_ids::ENTITY_RELATIVE_MOVE]);
                 bytes.extend_from_slice(&entity_id.to_be_bytes());
-                bytes.push(*delta_x);
-                bytes.push(*delta_y);
-                bytes.push(*delta_z);
+                bytes.extend_from_slice(&[*delta_x]);
+                bytes.extend_from_slice(&[*delta_y]);
+                bytes.extend_from_slice(&[*delta_z]);
             }
             ServerPacket::EntityLook {
                 entity_id,
                 yaw,
                 pitch,
             } => {
-                bytes.push(packet_ids::ENTITY_LOOK);
+                bytes.extend_from_slice(&[packet_ids::ENTITY_LOOK]);
                 bytes.extend_from_slice(&entity_id.to_be_bytes());
-                bytes.push(*yaw);
-                bytes.push(*pitch);
+                bytes.extend_from_slice(&[*yaw]);
+                bytes.extend_from_slice(&[*pitch]);
             }
             ServerPacket::EntityLookAndRelativeMove {
                 entity_id,
@@ -304,13 +303,13 @@ impl ServerPacket {
                 yaw,
                 pitch,
             } => {
-                bytes.push(packet_ids::ENTITY_LOOK_AND_RELATIVE_MOVE);
+                bytes.extend_from_slice(&[packet_ids::ENTITY_LOOK_AND_RELATIVE_MOVE]);
                 bytes.extend_from_slice(&entity_id.to_be_bytes());
-                bytes.push(*delta_x);
-                bytes.push(*delta_y);
-                bytes.push(*delta_z);
-                bytes.push(*yaw);
-                bytes.push(*pitch);
+                bytes.extend_from_slice(&[*delta_x]);
+                bytes.extend_from_slice(&[*delta_y]);
+                bytes.extend_from_slice(&[*delta_z]);
+                bytes.extend_from_slice(&[*yaw]);
+                bytes.extend_from_slice(&[*pitch]);
             }
             ServerPacket::EntityTeleport {
                 entity_id,
@@ -320,13 +319,13 @@ impl ServerPacket {
                 yaw,
                 pitch,
             } => {
-                bytes.push(packet_ids::ENTITY_TELEPORT);
+                bytes.extend_from_slice(&[packet_ids::ENTITY_TELEPORT]);
                 bytes.extend_from_slice(&entity_id.to_be_bytes());
                 bytes.extend_from_slice(&x.to_be_bytes());
                 bytes.extend_from_slice(&y.to_be_bytes());
                 bytes.extend_from_slice(&z.to_be_bytes());
-                bytes.push(*yaw);
-                bytes.push(*pitch);
+                bytes.extend_from_slice(&[*yaw]);
+                bytes.extend_from_slice(&[*pitch]);
             }
             ServerPacket::NamedEntitySpawn {
                 entity_id,
@@ -338,14 +337,14 @@ impl ServerPacket {
                 pitch,
                 current_item,
             } => {
-                bytes.push(packet_ids::NAMED_ENTITY_SPAWN);
+                bytes.extend_from_slice(&[packet_ids::NAMED_ENTITY_SPAWN]);
                 bytes.extend_from_slice(&entity_id.to_be_bytes());
                 write_utf16_string(&mut bytes, username);
                 bytes.extend_from_slice(&x.to_be_bytes());
                 bytes.extend_from_slice(&y.to_be_bytes());
                 bytes.extend_from_slice(&z.to_be_bytes());
-                bytes.push(*yaw);
-                bytes.push(*pitch);
+                bytes.extend_from_slice(&[*yaw]);
+                bytes.extend_from_slice(&[*pitch]);
                 bytes.extend_from_slice(&current_item.to_be_bytes());
             }
         }
@@ -355,7 +354,7 @@ impl ServerPacket {
 }
 
 /// Helper function to write UTF-16 strings in Minecraft protocol format
-fn write_utf16_string(buffer: &mut Vec<u8>, s: &str) {
+fn write_utf16_string(buffer: &mut BytesMut, s: &str) {
     let bytes = s.as_bytes();
     buffer.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
     for byte in bytes {

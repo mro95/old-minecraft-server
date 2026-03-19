@@ -11,7 +11,7 @@ use crate::{PlayerRegistry, packets::ServerPacket};
 
 pub struct Player {
     socket: Arc<Mutex<OwnedWriteHalf>>,
-    peer_addr: SocketAddr,
+    pub peer_addr: SocketAddr,
 
     username: Option<String>,
     pub entity_id: Option<i32>,
