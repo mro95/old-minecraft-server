@@ -255,29 +255,76 @@ async fn handle_packet(
                 y, stance, z, yaw, pitch, on_ground, "Player position and look update"
             );
 
+            let (old_position, old_rotation) = {
+                let player = player.read().await;
+                (player.position, player.rotation)
+            };
+
+    
+            // If position changed less then a threshold, we can send a relative move/look instead of teleport for better client interpolation
+            const POSITION_THRESHOLD: u8 = 4; // Less than 4 blocks it expected by the client.
+            let delta_x = ((x - old_position.0).abs() * 32.0) as u8;
+            let delta_y = ((y - old_position.1).abs() * 32.0) as u8;
+            let delta_z = ((z - old_position.2).abs() * 32.0) as u8;
+            let small_position_change = delta_x < POSITION_THRESHOLD && delta_y < POSITION_THRESHOLD && delta_z < POSITION_THRESHOLD;
+
+            let delta_yaw = ((yaw - old_rotation.0).abs() * 256.0 / 360.0) as u8;
+            let delta_pitch = ((pitch - old_rotation.1).abs() * 256.0 / 360.0) as u8;
+            let rotation_changed = delta_yaw > 0 || delta_pitch > 0;
+
             {
                 let mut player = player.write().await;
                 player.position = (x, y, z);
                 player.rotation = (yaw, pitch);
             }
 
-            // Broadcast the player's new position and look to all other players
-            player
-                .read()
-                .await
-                .broadcast_packet(
-                    &players,
-                    ServerPacket::EntityTeleport {
-                        entity_id: player.read().await.entity_id.unwrap_or(0),
-                        x: (x * 32.0) as i32,
-                        y: (y * 32.0) as i32,
-                        z: (z * 32.0) as i32,
-                        yaw: (yaw * 256.0 / 360.0) as u8,
-                        pitch: (pitch * 256.0 / 360.0) as u8,
-                    },
-                    false, // Don't include self in broadcast
-                )
-                .await?;
+            if small_position_change || rotation_changed {
+                debug!(
+                    small_position_change,
+                    rotation_changed,
+                    old_position = ?old_position,
+                    new_position = ?(x, y, z),
+                    old_rotation = ?old_rotation,
+                    new_rotation = ?(yaw, pitch),
+                    "Determined packet type to send based on changes"
+                );
+
+                // Send relative move/look because it's a small change, which allows client to interpolate smoothly
+                player
+                    .read()
+                    .await
+                    .broadcast_packet(
+                        &players,
+                        ServerPacket::EntityLookAndRelativeMove {
+                            entity_id: player.read().await.entity_id.unwrap_or(0),
+                            delta_x,
+                            delta_y,
+                            delta_z,
+                            yaw: (yaw * 256.0 / 360.0) as u8,
+                            pitch: (pitch * 256.0 / 360.0) as u8,
+                        },
+                        false, // Don't include self in broadcast
+                    )
+                    .await?;
+            } else {
+                // Broadcast the player's new position and look to all other players
+                player
+                    .read()
+                    .await
+                    .broadcast_packet(
+                        &players,
+                        ServerPacket::EntityTeleport {
+                            entity_id: player.read().await.entity_id.unwrap_or(0),
+                            x: (x * 32.0) as i32,
+                            y: (y * 32.0) as i32,
+                            z: (z * 32.0) as i32,
+                            yaw: (yaw * 256.0 / 360.0) as u8,
+                            pitch: (pitch * 256.0 / 360.0) as u8,
+                        },
+                        false, // Don't include self in broadcast
+                    )
+                    .await?;
+            }
         }
         ClientPacket::PlayerDigging {
             status,
