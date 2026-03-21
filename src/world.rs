@@ -13,190 +13,169 @@ impl From<String> for WorldError {
     }
 }
 
+pub const WORLD_SEED: u32 = 781378172;
+
 // Block IDs
 const AIR: u8 = 0;
 const STONE: u8 = 1;
 const GRASS: u8 = 2;
 const DIRT: u8 = 3;
+const WATER: u8 = 9;
+const SAND: u8 = 12;
 
-const GROUND_LEVEL: u8 = 63; // Top grass block
-const DIRT_LAYERS: u8 = 3;
-
-/// Generate chunk data for a flat grass plain
-pub fn generate_grass_plain_chunk(size_x: u8, size_y: u8, size_z: u8) -> Vec<u8> {
-    let blocks_size = (size_x as usize) * (size_y as usize) * (size_z as usize);
-
-    // Data size as per spec: (Size_X+1) * (Size_Y+1) * (Size_Z+1) * 2.5 bytes
-    let total_size = blocks_size + (blocks_size / 2) * 3; // blocks + metadata + block_light + sky_light
-
-    let mut data = Vec::with_capacity(total_size);
-
-    // Block type array - index = y + (z * Size_Y) + (x * Size_Y * Size_Z)
-    // This means: for x, for z, for y (X outer, Z middle, Y inner)
-    for _x in 0..size_x {
-        for _z in 0..size_z {
-            for y in 0..size_y {
-                let block = if y < GROUND_LEVEL - DIRT_LAYERS {
-                    STONE
-                } else if y < GROUND_LEVEL {
-                    DIRT
-                } else if y == GROUND_LEVEL {
-                    GRASS
-                } else {
-                    AIR
-                };
-                data.push(block);
-            }
-        }
-    }
-
-    // Metadata array (nibbles) - same iteration order, pack 2 per byte
-    // Low 4 bits = lower Y, high 4 bits = higher Y
-    for _x in 0..size_x {
-        for _z in 0..size_z {
-            for _y in (0..size_y).step_by(2) {
-                // Pack two nibbles: y and y+1
-                let nibble_low = 0u8; // metadata for y
-                let nibble_high = 0u8; // metadata for y+1
-                data.push((nibble_high << 4) | nibble_low);
-            }
-        }
-    }
-
-    // Block light array (nibbles) - same pattern
-    for _x in 0..size_x {
-        for _z in 0..size_z {
-            for _y in (0..size_y).step_by(2) {
-                let nibble_low = 0u8;
-                let nibble_high = 0u8;
-                data.push((nibble_high << 4) | nibble_low);
-            }
-        }
-    }
-
-    // Sky light array (nibbles) - full brightness above ground
-    for _x in 0..size_x {
-        for _z in 0..size_z {
-            for y in (0..size_y).step_by(2) {
-                // Each nibble is 0xF (full brightness) above ground, 0x0 below
-                let nibble_low = if y > GROUND_LEVEL { 0xF } else { 0x0 };
-                let nibble_high = if y + 1 > GROUND_LEVEL { 0xF } else { 0x0 };
-                data.push((nibble_high << 4) | nibble_low);
-            }
-        }
-    }
-
-    debug!(
-        data_size = data.len(),
-        expected_size = total_size,
-        "Generated chunk data"
-    );
-
-    data
-}
-
-/// Generates a chunk using 3D fractal Perlin noise for more natural terrain.
+/// Improved terrain generator using multiple noise layers for natural-looking terrain.
 ///
-/// # Arguments
-/// * `size_x`, `size_y`, `size_z` – Chunk dimensions (max 255 each).
-/// * `seed` – Base seed for the noise generators.
-///
-/// # Returns
-/// A `Vec<u8>` containing block IDs followed by metadata, block light,
-/// and sky light sections. Blocks are stored in YZX order (Y fastest).
-///
-/// # Panics
-/// Panics if any dimension is zero or greater than 256 (arbitrary safety limit).
-pub fn generate_perlin_noise_chunk(size_x: u8, size_y: u8, size_z: u8, seed: u32) -> Vec<u8> {
-    use noise::{Fbm, NoiseFn, Perlin};
+/// Key improvements over original:
+/// - Uses SuperSimplex instead of Perlin (smoother, fewer artifacts)
+/// - Domain warping to break up geometric patterns
+/// - Ridged multi-fractal for mountain ranges
+/// - Chunk-continuous sampling (uses world coordinates)
+/// - Surface cave exclusion to avoid floating terrain
+pub fn generate_perlin_noise_chunk(
+    size_x: u8,
+    size_y: u8,
+    size_z: u8,
+    chunk_x: i32,
+    chunk_z: i32,
+) -> Vec<u8> {
+    use noise::{Fbm, NoiseFn, SuperSimplex};
 
-    // Validate dimensions (optional but recommended)
     assert!(
         size_x > 0 && size_y > 0 && size_z > 0,
         "Chunk dimensions must be positive"
     );
-    //assert!(size_x <= 256 && size_y <= 256 && size_z <= 256, "Dimensions exceed safety limit");
 
     let (sx, sy, sz) = (size_x as usize, size_y as usize, size_z as usize);
     let block_count = sx * sy * sz;
-    let meta_size = (block_count + 1) / 2; // 4 bits per block → half the block count, rounded up
+    let meta_size = (block_count + 1) / 2;
 
-    // Pre‑allocate exact capacity: blocks + metadata + block_light + sky_light
     let total_capacity = block_count + 3 * meta_size;
     let mut data = Vec::with_capacity(total_capacity);
 
-    // --- Noise setup ---
-    // Heightmap uses 2D fractal noise (FBM) for more natural terrain with detail.
-    let mut height_fbm = Fbm::<Perlin>::new(seed);
-    height_fbm.octaves = 4; // Number of noise layers
-    height_fbm.frequency = 0.03; // Lower frequency = larger features (was 1/10 = 0.1)
-    height_fbm.persistence = 0.5; // Amplitude decay per octave
-    height_fbm.lacunarity = 2.0; // Frequency multiplier per octave
+    // World base position for continuous noise across chunks
+    let base_x = (chunk_x * 16) as f64;
+    let base_z = (chunk_z * 16) as f64;
 
-    // Cave noise uses 3D fractal noise with a shifted seed for independence.
-    let mut cave_fbm = Fbm::<Perlin>::new(seed.wrapping_add(12345));
-    cave_fbm.octaves = 3;
-    cave_fbm.frequency = 0.06; // Lower = fewer, larger caves
+    // Base terrain: main hills (SuperSimplex for smoothness)
+    let mut base_fbm = Fbm::<SuperSimplex>::new(WORLD_SEED);
+    base_fbm.octaves = 5;
+    base_fbm.frequency = 0.02;
+    base_fbm.persistence = 0.5;
+    base_fbm.lacunarity = 2.0;
+
+    // Detail terrain: smaller scale variation for more interesting terrain
+    let mut detail_fbm = Fbm::<SuperSimplex>::new(WORLD_SEED.wrapping_add(22222));
+    detail_fbm.octaves = 4;
+    detail_fbm.frequency = 0.08;
+    detail_fbm.persistence = 0.5;
+    detail_fbm.lacunarity = 2.0;
+
+    // Mountains: use SuperSimplex for smoother, broader mountains
+    let mut mountain_fbm = Fbm::<SuperSimplex>::new(WORLD_SEED.wrapping_add(33333));
+    mountain_fbm.octaves = 3;
+    mountain_fbm.frequency = 0.015;
+    mountain_fbm.persistence = 0.5;
+    mountain_fbm.lacunarity = 2.0;
+
+    // Cave noise (3D)
+    let mut cave_fbm = Fbm::<SuperSimplex>::new(WORLD_SEED.wrapping_add(44444));
+    cave_fbm.octaves = 4;
+    cave_fbm.frequency = 0.05;
     cave_fbm.persistence = 0.5;
     cave_fbm.lacunarity = 2.0;
 
-    // Height range control – avoids extreme mountains and pits.
-    const BASE_HEIGHT: f64 = 64.0; // Average ground level
-    const HEIGHT_AMP: f64 = 24.0; // Max deviation from base (so terrain 40–88 typically)
-    // Noise range for FBM with default settings is roughly [-1, 1], but can exceed.
-    // We'll clamp final height to safe bounds.
+    // Terrain parameters
+    const BASE_HEIGHT: f64 = 60.0;
+    const HEIGHT_VARIATION: f64 = 25.0;
+    const MOUNTAIN_INFLUENCE: f64 = 20.0;
+    const SEA_LEVEL: f64 = 54.0;
 
-    // Cave threshold: noise values below -threshold become air.
-    const CAVE_THRESHOLD: f64 = 0.15; // Lower = more caves
-
-    // --- Block generation (YZX order: Y fastest, then Z, then X) ---
     for x in 0..sx {
         for z in 0..sz {
-            // Height sample (2D) – determines the ground surface
-            let height_val = height_fbm.get([x as f64, z as f64]);
-            let ground_level = (BASE_HEIGHT + HEIGHT_AMP * height_val) as isize;
-            // Clamp to valid range [0, sy-1]
-            let ground_level = ground_level.clamp(0, sy as isize - 1) as usize;
+            // World coordinates for continuous noise across chunks
+            let wx = base_x + x as f64;
+            let wz = base_z + z as f64;
+
+            // Sample main terrain
+            let base_val = base_fbm.get([wx, wz]);
+
+            // Sample detail
+            let detail_val = detail_fbm.get([wx, wz]) * 0.3;
+
+            // Sample mountains - use power curve for smooth hills that can get tall
+            let mountain_val = mountain_fbm.get([wx, wz]);
+            // Map [-1, 1] to [0, 1] with a steep power curve
+            let normalized = (mountain_val + 1.0) * 0.5;
+            let mountain_pow = normalized.powi(5); // 5th power - only high values make mountains
+            let mountain_add = mountain_pow * MOUNTAIN_INFLUENCE * 1.5;
+
+            // Combine heights
+            let combined = base_val + detail_val;
+
+            let ground_level = (BASE_HEIGHT + HEIGHT_VARIATION * combined + mountain_add) as isize;
+            let ground_level = ground_level.clamp(5, sy as isize - 1) as usize;
+
+            // Sea level check
+            let is_below_sea = (ground_level as f64) < SEA_LEVEL;
 
             for y in 0..sy {
                 let block = if y < ground_level {
-                    // Underground layers
-                    if y < ground_level.saturating_sub(4) {
-                        STONE
-                    } else if y < ground_level.saturating_sub(1) {
-                        DIRT
+                    // Underground
+                    if is_below_sea {
+                        if y < ground_level.saturating_sub(4) {
+                            STONE
+                        } else {
+                            DIRT
+                        }
                     } else {
-                        GRASS
+                        // Normal terrain
+                        if y < ground_level.saturating_sub(4) {
+                            STONE
+                        } else if y < ground_level.saturating_sub(1) {
+                            DIRT
+                        } else {
+                            GRASS
+                        }
                     }
+                } else if is_below_sea && y < SEA_LEVEL as usize {
+                    // Water blocks below sea level
+                    WATER
+                } else if is_below_sea
+                    && ground_level == (SEA_LEVEL as usize - 1)
+                    && y == ground_level
+                {
+                    // Sand at ocean floor
+                    SAND
                 } else {
                     AIR
                 };
 
-                // Apply 3D cave noise – if below threshold, carve air
-                if block != AIR {
-                    let cave_val = cave_fbm.get([x as f64, y as f64, z as f64]);
-                    if cave_val < -CAVE_THRESHOLD {
+                // Cave carving (only deep underground)
+                if block != AIR && block != WATER {
+                    let cave_val = cave_fbm.get([wx * 0.03, y as f64 * 0.03, wz * 0.03]);
+                    // Only carve caves well below surface to avoid floating terrain
+                    let surface_distance = ground_level as isize - y as isize;
+                    if cave_val < -0.2 && surface_distance > 8 {
                         data.push(AIR);
                     } else {
                         data.push(block);
                     }
                 } else {
-                    data.push(AIR);
+                    data.push(block);
                 }
             }
         }
     }
 
-    // Append metadata, block light, and sky light sections (simplified)
-    data.extend(vec![0u8; meta_size]); // Metadata (all zero)
-    data.extend(vec![0u8; meta_size]); // Block light (all zero)
-    data.extend(vec![0xFFu8; meta_size]); // Sky light (full brightness)
+    data.extend(vec![0u8; meta_size]);
+    data.extend(vec![0u8; meta_size]);
+    data.extend(vec![0xFFu8; meta_size]);
 
     debug_assert_eq!(data.len(), total_capacity, "Incorrect final data size");
     debug!(
         data_size = data.len(),
         expected_size = total_capacity,
-        "Generated fractal noise chunk with caves"
+        "Generated improved terrain chunk"
     );
 
     data

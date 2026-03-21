@@ -212,15 +212,12 @@ impl ChunkManager {
     }
 
     fn generate_chunk(&self, pos: ChunkPos) -> Chunk {
-        let seed = 781378172u32
-            .wrapping_add(pos.x as u32 * 348712)
-            .wrapping_add(pos.z as u32 * 7987541);
-
         let data = generate_perlin_noise_chunk(
             CHUNK_SIZE_X as u8,
             CHUNK_SIZE_Y as u8,
             CHUNK_SIZE_Z as u8,
-            seed,
+            pos.x,
+            pos.z,
         );
 
         let mut chunk = Chunk::new(pos);
