@@ -1,6 +1,9 @@
 use thiserror::Error;
 use tracing::{debug, warn};
 
+use crate::config::{Biome, OreSettings, WorldConfig};
+use rand::{rngs::StdRng, Rng};
+
 #[derive(Error, Debug)]
 pub enum WorldError {
     #[error("Compression failed: {0}")]
@@ -13,32 +16,32 @@ impl From<String> for WorldError {
     }
 }
 
-pub const WORLD_SEED: u32 = 781378172;
+pub const AIR: u8 = 0;
+pub const STONE: u8 = 1;
+pub const GRASS: u8 = 2;
+pub const DIRT: u8 = 3;
+pub const WATER: u8 = 9;
+pub const SAND: u8 = 12;
+pub const GRAVEL: u8 = 13;
+pub const SNOW: u8 = 80;
+pub const OAK_WOOD: u8 = 17;
+pub const OAK_LEAVES: u8 = 18;
 
-// Block IDs
-const AIR: u8 = 0;
-const STONE: u8 = 1;
-const GRASS: u8 = 2;
-const DIRT: u8 = 3;
-const WATER: u8 = 9;
-const SAND: u8 = 12;
+pub const COAL_ORE: u8 = 16;
+pub const IRON_ORE: u8 = 15;
+pub const GOLD_ORE: u8 = 14;
+pub const DIAMOND_ORE: u8 = 56;
 
-/// Improved terrain generator using multiple noise layers for natural-looking terrain.
-///
-/// Key improvements over original:
-/// - Uses SuperSimplex instead of Perlin (smoother, fewer artifacts)
-/// - Domain warping to break up geometric patterns
-/// - Ridged multi-fractal for mountain ranges
-/// - Chunk-continuous sampling (uses world coordinates)
-/// - Surface cave exclusion to avoid floating terrain
 pub fn generate_perlin_noise_chunk(
     size_x: u8,
     size_y: u8,
     size_z: u8,
     chunk_x: i32,
     chunk_z: i32,
+    config: &WorldConfig,
 ) -> Vec<u8> {
     use noise::{Fbm, NoiseFn, SuperSimplex};
+    use rand::SeedableRng;
 
     assert!(
         size_x > 0 && size_y > 0 && size_z > 0,
@@ -47,116 +50,199 @@ pub fn generate_perlin_noise_chunk(
 
     let (sx, sy, sz) = (size_x as usize, size_y as usize, size_z as usize);
     let block_count = sx * sy * sz;
-    let meta_size = (block_count + 1) / 2;
+    let meta_size = (block_count + 1).div_ceil(2);
 
     let total_capacity = block_count + 3 * meta_size;
     let mut data = Vec::with_capacity(total_capacity);
 
-    // World base position for continuous noise across chunks
     let base_x = (chunk_x * 16) as f64;
     let base_z = (chunk_z * 16) as f64;
 
-    // Base terrain: main hills (SuperSimplex for smoothness)
-    let mut base_fbm = Fbm::<SuperSimplex>::new(WORLD_SEED);
-    base_fbm.octaves = 5;
-    base_fbm.frequency = 0.02;
-    base_fbm.persistence = 0.5;
-    base_fbm.lacunarity = 2.0;
+    let terrain = &config.terrain;
+    let caves = &config.caves;
+    let ores = &config.ores;
+    let biomes = &config.biomes;
+    let _structures = &config.structures;
 
-    // Detail terrain: smaller scale variation for more interesting terrain
-    let mut detail_fbm = Fbm::<SuperSimplex>::new(WORLD_SEED.wrapping_add(22222));
-    detail_fbm.octaves = 4;
-    detail_fbm.frequency = 0.08;
-    detail_fbm.persistence = 0.5;
-    detail_fbm.lacunarity = 2.0;
+    let mut base_fbm = Fbm::<SuperSimplex>::new(config.world.seed);
+    base_fbm.octaves = terrain.base_terrain.octaves;
+    base_fbm.frequency = terrain.base_terrain.frequency;
+    base_fbm.persistence = terrain.base_terrain.persistence;
+    base_fbm.lacunarity = terrain.base_terrain.lacunarity;
 
-    // Mountains: use SuperSimplex for smoother, broader mountains
-    let mut mountain_fbm = Fbm::<SuperSimplex>::new(WORLD_SEED.wrapping_add(33333));
-    mountain_fbm.octaves = 3;
-    mountain_fbm.frequency = 0.015;
-    mountain_fbm.persistence = 0.5;
-    mountain_fbm.lacunarity = 2.0;
+    let mut detail_fbm = Fbm::<SuperSimplex>::new(config.world.seed.wrapping_add(22222));
+    detail_fbm.octaves = terrain.detail.octaves;
+    detail_fbm.frequency = terrain.detail.frequency;
+    detail_fbm.persistence = terrain.detail.persistence;
+    detail_fbm.lacunarity = terrain.detail.lacunarity;
 
-    // Cave noise (3D)
-    let mut cave_fbm = Fbm::<SuperSimplex>::new(WORLD_SEED.wrapping_add(44444));
-    cave_fbm.octaves = 4;
-    cave_fbm.frequency = 0.05;
-    cave_fbm.persistence = 0.5;
-    cave_fbm.lacunarity = 2.0;
+    let mut mountain_fbm = Fbm::<SuperSimplex>::new(config.world.seed.wrapping_add(33333));
+    mountain_fbm.octaves = terrain.mountains.octaves;
+    mountain_fbm.frequency = terrain.mountains.frequency;
+    mountain_fbm.persistence = terrain.mountains.persistence;
+    mountain_fbm.lacunarity = terrain.mountains.lacunarity;
 
-    // Terrain parameters
-    const BASE_HEIGHT: f64 = 60.0;
-    const HEIGHT_VARIATION: f64 = 25.0;
-    const MOUNTAIN_INFLUENCE: f64 = 20.0;
-    const SEA_LEVEL: f64 = 54.0;
+    let mut cave_fbm = Fbm::<SuperSimplex>::new(config.world.seed.wrapping_add(44444));
+    cave_fbm.octaves = caves.octaves;
+    cave_fbm.frequency = caves.frequency;
+    cave_fbm.persistence = caves.persistence;
+    cave_fbm.lacunarity = caves.lacunarity;
+
+    let mut temp_fbm = Fbm::<SuperSimplex>::new(config.world.seed.wrapping_add(55555));
+    temp_fbm.octaves = 3;
+    temp_fbm.frequency = biomes.temperature_scale;
+    temp_fbm.persistence = 0.5;
+    temp_fbm.lacunarity = 2.0;
+
+    let mut humidity_fbm = Fbm::<SuperSimplex>::new(config.world.seed.wrapping_add(66666));
+    humidity_fbm.octaves = 3;
+    humidity_fbm.frequency = biomes.humidity_scale;
+    humidity_fbm.persistence = 0.5;
+    humidity_fbm.lacunarity = 2.0;
+
+    let mut river_fbm = Fbm::<SuperSimplex>::new(config.world.seed.wrapping_add(77777));
+    river_fbm.octaves = 4;
+    river_fbm.frequency = 0.025;
+    river_fbm.persistence = 0.5;
+    river_fbm.lacunarity = 2.0;
+
+    let seed = config
+        .world
+        .seed
+        .wrapping_add((chunk_x as u32).wrapping_mul(12345))
+        .wrapping_add((chunk_z as u32).wrapping_mul(67890));
+    let mut rng = StdRng::seed_from_u64(seed as u64);
+
+    let heightmap = {
+        let mut map = vec![0usize; sx * sz];
+        for x in 0..sx {
+            for z in 0..sz {
+                let wx = base_x + x as f64;
+                let wz = base_z + z as f64;
+
+                let base_val = base_fbm.get([wx, wz]);
+                let detail_val = detail_fbm.get([wx, wz]) * terrain.detail.weight;
+
+                let mountain_val = mountain_fbm.get([wx, wz]);
+                let normalized = (mountain_val + 1.0) * 0.5;
+                let mountain_pow = normalized.powi(terrain.mountains.power as i32);
+                let mountain_add = mountain_pow * terrain.mountains.influence * 1.5;
+
+                let combined = base_val + detail_val;
+                let ground_level = (terrain.base_height
+                    + terrain.height_variation * combined
+                    + mountain_add) as isize;
+                map[x * sz + z] = ground_level.clamp(5, sy as isize - 1) as usize;
+            }
+        }
+        map
+    };
+
+    let biomemap = {
+        let mut map = vec![Biome::Plains; sx * sz];
+        for x in 0..sx {
+            for z in 0..sz {
+                let wx = base_x + x as f64;
+                let wz = base_z + z as f64;
+
+                let ground_level = heightmap[x * sz + z];
+                let is_below_sea = (ground_level as f64) < terrain.sea_level;
+
+                let temp = temp_fbm.get([wx, wz]);
+                let humidity = humidity_fbm.get([wx, wz]);
+
+                let biome = if is_below_sea {
+                    Biome::Ocean
+                } else {
+                    let height_factor = mountain_fbm.get([wx, wz]);
+
+                    if height_factor > 0.5 {
+                        Biome::Mountains
+                    } else if temp > 0.3 && humidity < 0.0 {
+                        Biome::Desert
+                    } else if humidity > 0.2 && temp < 0.1 {
+                        Biome::Taiga
+                    } else if humidity > 0.3 && ground_level < (terrain.sea_level as usize + 2) {
+                        Biome::Swamp
+                    } else if humidity > 0.2 && temp > 0.0 {
+                        Biome::Forest
+                    } else if ground_level < (terrain.sea_level as usize + 1) {
+                        Biome::Beach
+                    } else {
+                        Biome::Plains
+                    }
+                };
+
+                map[x * sz + z] = biome;
+            }
+        }
+        map
+    };
+
+    let river_map = {
+        let mut map = vec![false; sx * sz];
+        for x in 0..sx {
+            for z in 0..sz {
+                let wx = base_x + x as f64;
+                let wz = base_z + z as f64;
+
+                let river_val = river_fbm.get([wx, wz]);
+                let ground_level = heightmap[x * sz + z];
+
+                map[x * sz + z] = river_val > 0.55
+                    && ground_level > (terrain.sea_level as usize - 3)
+                    && ground_level < (terrain.sea_level as usize + 5);
+            }
+        }
+        map
+    };
 
     for x in 0..sx {
         for z in 0..sz {
-            // World coordinates for continuous noise across chunks
-            let wx = base_x + x as f64;
-            let wz = base_z + z as f64;
-
-            // Sample main terrain
-            let base_val = base_fbm.get([wx, wz]);
-
-            // Sample detail
-            let detail_val = detail_fbm.get([wx, wz]) * 0.3;
-
-            // Sample mountains - use power curve for smooth hills that can get tall
-            let mountain_val = mountain_fbm.get([wx, wz]);
-            // Map [-1, 1] to [0, 1] with a steep power curve
-            let normalized = (mountain_val + 1.0) * 0.5;
-            let mountain_pow = normalized.powi(5); // 5th power - only high values make mountains
-            let mountain_add = mountain_pow * MOUNTAIN_INFLUENCE * 1.5;
-
-            // Combine heights
-            let combined = base_val + detail_val;
-
-            let ground_level = (BASE_HEIGHT + HEIGHT_VARIATION * combined + mountain_add) as isize;
-            let ground_level = ground_level.clamp(5, sy as isize - 1) as usize;
-
-            // Sea level check
-            let is_below_sea = (ground_level as f64) < SEA_LEVEL;
+            let ground_level = heightmap[x * sz + z];
+            let biome = biomemap[x * sz + z];
+            let is_river = river_map[x * sz + z];
 
             for y in 0..sy {
-                let block = if y < ground_level {
-                    // Underground
-                    if is_below_sea {
-                        if y < ground_level.saturating_sub(4) {
-                            STONE
-                        } else {
-                            DIRT
-                        }
-                    } else {
-                        // Normal terrain
-                        if y < ground_level.saturating_sub(4) {
-                            STONE
-                        } else if y < ground_level.saturating_sub(1) {
-                            DIRT
-                        } else {
-                            GRASS
-                        }
-                    }
-                } else if is_below_sea && y < SEA_LEVEL as usize {
-                    // Water blocks below sea level
-                    WATER
-                } else if is_below_sea
-                    && ground_level == (SEA_LEVEL as usize - 1)
-                    && y == ground_level
+                let block = if is_river
+                    && ground_level > (terrain.sea_level as usize - 2)
+                    && ground_level < (terrain.sea_level as usize + 3)
+                    && y >= (terrain.sea_level as usize - 2)
+                    && y <= (terrain.sea_level as usize)
                 {
-                    // Sand at ocean floor
-                    SAND
+                    if y < ground_level {
+                        STONE
+                    } else if y <= terrain.sea_level as usize {
+                        WATER
+                    } else {
+                        AIR
+                    }
+                } else if y < ground_level {
+                    if y < ground_level.saturating_sub(4) {
+                        STONE
+                    } else if y < ground_level.saturating_sub(1) {
+                        biome.subsurface_block()
+                    } else {
+                        biome.surface_block()
+                    }
+                } else if (ground_level as f64) < terrain.sea_level
+                    && y < terrain.sea_level as usize
+                {
+                    WATER
                 } else {
                     AIR
                 };
 
-                // Cave carving (only deep underground)
                 if block != AIR && block != WATER {
-                    let cave_val = cave_fbm.get([wx * 0.03, y as f64 * 0.03, wz * 0.03]);
-                    // Only carve caves well below surface to avoid floating terrain
-                    let surface_distance = ground_level as isize - y as isize;
-                    if cave_val < -0.2 && surface_distance > 8 {
-                        data.push(AIR);
+                    if caves.enabled {
+                        let cave_val =
+                            cave_fbm.get([base_x + x as f64, y as f64, base_z + z as f64]);
+                        let surface_distance = ground_level as isize - y as isize;
+                        if cave_val < caves.threshold && surface_distance > caves.min_depth {
+                            data.push(AIR);
+                        } else {
+                            data.push(block);
+                        }
                     } else {
                         data.push(block);
                     }
@@ -167,6 +253,13 @@ pub fn generate_perlin_noise_chunk(
         }
     }
 
+    if ores.enabled {
+        generate_ores(&mut data, sx, sy, sz, &ores.coal, &mut rng);
+        generate_ores(&mut data, sx, sy, sz, &ores.iron, &mut rng);
+        generate_ores(&mut data, sx, sy, sz, &ores.gold, &mut rng);
+        generate_ores(&mut data, sx, sy, sz, &ores.diamond, &mut rng);
+    }
+
     data.extend(vec![0u8; meta_size]);
     data.extend(vec![0u8; meta_size]);
     data.extend(vec![0xFFu8; meta_size]);
@@ -175,10 +268,45 @@ pub fn generate_perlin_noise_chunk(
     debug!(
         data_size = data.len(),
         expected_size = total_capacity,
-        "Generated improved terrain chunk"
+        "Generated chunk"
     );
 
     data
+}
+
+fn generate_ores(
+    data: &mut [u8],
+    sx: usize,
+    sy: usize,
+    sz: usize,
+    ore: &OreSettings,
+    rng: &mut StdRng,
+) {
+    let block_count = sx * sy * sz;
+
+    for _ in 0..ore.attempts_per_chunk {
+        let ox = (rng.next_u32() as usize) % sx;
+        let oy = ore.min_height
+            + ((rng.next_u32() as usize) % (ore.max_height.saturating_sub(ore.min_height).max(1)));
+        let oz = (rng.next_u32() as usize) % sz;
+
+        for dx in 0..ore.vein_size {
+            for dy in 0..ore.vein_size {
+                for dz in 0..ore.vein_size {
+                    let px = ox + dx;
+                    let py = oy + dy;
+                    let pz = oz + dz;
+
+                    if px < sx && py < sy && pz < sz {
+                        let idx = py + pz * sy + px * sy * sz;
+                        if idx < block_count && data[idx] == STONE {
+                            data[idx] = ore.block_id;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Verify that compressed data is in valid zlib format

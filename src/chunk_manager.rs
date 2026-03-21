@@ -8,6 +8,7 @@ use tokio::time::{interval, sleep};
 use tokio::{sync::RwLock, time::MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
+use crate::config::WorldConfig;
 use crate::world::{compress_chunk_data, generate_perlin_noise_chunk};
 
 pub const CHUNK_SIZE_X: usize = 16;
@@ -45,7 +46,7 @@ impl ChunkPos {
         format!("chunk_{}_{}.bin", self.x, self.z)
     }
 
-    pub fn to_block_pos(&self) -> (i32, i32) {
+    pub fn get_block_pos(&self) -> (i32, i32) {
         (self.x * 16, self.z * 16)
     }
 
@@ -111,7 +112,7 @@ impl Chunk {
 
     pub fn to_network_data(&self) -> Vec<u8> {
         let block_count = CHUNK_SIZE_X * CHUNK_SIZE_Y * CHUNK_SIZE_Z;
-        let meta_size = (block_count + 1) / 2;
+        let meta_size = (block_count + 1).div_ceil(2);
 
         let mut data = Vec::with_capacity(block_count + 3 * meta_size);
 
@@ -128,13 +129,15 @@ impl Chunk {
 pub struct ChunkManager {
     chunks: RwLock<HashMap<ChunkPos, Chunk>>,
     world_dir: PathBuf,
+    config: WorldConfig,
 }
 
 impl ChunkManager {
-    pub fn new(world_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(world_dir: impl Into<PathBuf>, config: WorldConfig) -> Self {
         Self {
             chunks: RwLock::new(HashMap::new()),
             world_dir: world_dir.into(),
+            config,
         }
     }
 
@@ -218,6 +221,7 @@ impl ChunkManager {
             CHUNK_SIZE_Z as u8,
             pos.x,
             pos.z,
+            &self.config,
         );
 
         let mut chunk = Chunk::new(pos);
@@ -242,8 +246,8 @@ impl ChunkManager {
         let chunk_x = (x as i32).div_euclid(16);
         let chunk_z = (z as i32).div_euclid(16);
         let chunk_pos = ChunkPos::new(chunk_x, chunk_z);
-        let local_x = x.rem_euclid(16) as usize;
-        let local_z = z.rem_euclid(16) as usize;
+        let local_x = x.rem_euclid(16);
+        let local_z = z.rem_euclid(16);
 
         let mut chunks = self.chunks.write().await;
         let chunk = match chunks.get_mut(&chunk_pos) {
@@ -283,11 +287,9 @@ impl ChunkManager {
     async fn save_chunk(&self, chunk: &Chunk) -> bool {
         let path = self.world_dir.join("chunks").join(chunk.pos.filename());
 
-        if let Some(parent) = path.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                error!(error = %e, "Failed to create chunk directory");
-                return false;
-            }
+        if let Some(parent) = path.parent() && let Err(e) = tokio::fs::create_dir_all(parent).await {
+            error!(error = %e, "Failed to create chunk directory");
+            return false;
         }
 
         let data = chunk.to_network_data();

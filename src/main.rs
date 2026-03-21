@@ -1,4 +1,5 @@
 mod chunk_manager;
+mod config;
 mod errors;
 mod packet_ids;
 mod packets;
@@ -8,6 +9,7 @@ mod server;
 mod world;
 
 pub use chunk_manager::{ChunkManager, SharedChunkManager};
+pub use config::WorldConfig;
 pub use errors::{Result, ServerError};
 
 use std::{collections::HashMap, sync::Arc};
@@ -30,12 +32,18 @@ async fn main() -> crate::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    let world_config = WorldConfig::load_or_default("world_config.toml");
+    info!(
+        seed = world_config.world.seed,
+        "Loaded world configuration"
+    );
+
     let listener = TcpListener::bind("127.0.0.1:25565").await?;
     info!("Server listening on 127.0.0.1:25565");
 
     let players: PlayerRegistry = Arc::new(RwLock::new(HashMap::new()));
 
-    let chunk_manager: SharedChunkManager = Arc::new(ChunkManager::new("world"));
+    let chunk_manager: SharedChunkManager = Arc::new(ChunkManager::new("world", world_config));
     chunk_manager.clone().start_auto_save().await;
     info!("Auto-save task started (every 60 seconds)");
 

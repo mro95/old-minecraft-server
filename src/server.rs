@@ -123,7 +123,7 @@ pub async fn handle_connection(
                 }
                 Err(e) => {
                     // Log details about the error to help debug
-                    let buffer_preview = if buffer.len() > 0 {
+                    let buffer_preview = if !buffer.is_empty() {
                         let preview_len = buffer.len().min(10);
                         format!("{:02X?}", &buffer[..preview_len])
                     } else {
@@ -405,14 +405,13 @@ async fn handle_packet(
             info!(reason = %reason, "Client disconnect");
             // Clean up player from registry
             let mut players_lock = players.write().await;
-            if let Some(addr) = player
+            if let Ok(addr) = player
                 .read()
                 .await
                 .get_socket()
                 .lock()
                 .await
                 .peer_addr()
-                .ok()
             {
                 players_lock.remove(&addr);
                 info!(address = %addr, "Player removed from registry");

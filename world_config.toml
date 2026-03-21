@@ -1,0 +1,83 @@
+# World Generation Configuration
+
+[world]
+seed = 781378172
+
+[terrain]
+base_height = 60.0
+height_variation = 25.0
+sea_level = 54.0
+
+[terrain.base_terrain]
+frequency = 0.02
+octaves = 5
+persistence = 0.5
+lacunarity = 2.0
+
+[terrain.detail]
+frequency = 0.08
+octaves = 4
+persistence = 0.5
+lacunarity = 2.0
+weight = 0.3
+
+[terrain.mountains]
+frequency = 0.015
+octaves = 3
+persistence = 0.5
+lacunarity = 2.0
+influence = 20.0
+power = 5
+
+[biomes]
+enabled = true
+temperature_scale = 0.008
+humidity_scale = 0.008
+
+[structures]
+trees_enabled = true
+tree_chance = 0.05
+
+[structures.rivers]
+enabled = true
+frequency = 0.01
+
+[caves]
+enabled = true
+frequency = 0.05
+octaves = 4
+persistence = 0.5
+lacunarity = 2.0
+threshold = -0.2
+min_depth = 8
+
+[ores]
+enabled = true
+
+[ores.coal]
+block_id = 16
+vein_size = 8
+attempts_per_chunk = 15
+min_height = 5
+max_height = 128
+
+[ores.iron]
+block_id = 15
+vein_size = 6
+attempts_per_chunk = 10
+min_height = 5
+max_height = 64
+
+[ores.gold]
+block_id = 14
+vein_size = 5
+attempts_per_chunk = 5
+min_height = 5
+max_height = 32
+
+[ores.diamond]
+block_id = 56
+vein_size = 4
+attempts_per_chunk = 2
+min_height = 5
+max_height = 16
