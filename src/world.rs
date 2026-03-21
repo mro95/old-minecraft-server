@@ -143,8 +143,8 @@ pub fn generate_perlin_noise_chunk(size_x: u8, size_y: u8, size_z: u8, seed: u32
     // Height range control – avoids extreme mountains and pits.
     const BASE_HEIGHT: f64 = 64.0; // Average ground level
     const HEIGHT_AMP: f64 = 24.0; // Max deviation from base (so terrain 40–88 typically)
-                                  // Noise range for FBM with default settings is roughly [-1, 1], but can exceed.
-                                  // We'll clamp final height to safe bounds.
+    // Noise range for FBM with default settings is roughly [-1, 1], but can exceed.
+    // We'll clamp final height to safe bounds.
 
     // Cave threshold: noise values below -threshold become air.
     const CAVE_THRESHOLD: f64 = 0.15; // Lower = more caves

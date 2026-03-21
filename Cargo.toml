@@ -14,3 +14,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4.3"
 noise = "0.9.0"
 rand = "0.10.0"
+flats = "0.1.0"

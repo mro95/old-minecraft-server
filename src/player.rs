@@ -7,7 +7,7 @@ use std::{
 
 use tokio::{io::AsyncWriteExt as _, net::tcp::OwnedWriteHalf, sync::Mutex};
 
-use crate::{PlayerRegistry, packets::ServerPacket, Result};
+use crate::{chunk_manager::ChunkPos, PlayerRegistry, Result, packets::ServerPacket};
 
 pub struct Player {
     socket: Arc<Mutex<OwnedWriteHalf>>,
@@ -17,6 +17,7 @@ pub struct Player {
     pub entity_id: Option<i32>,
     pub position: (f64, f64, f64),
     pub rotation: (f32, f32), // yaw, pitch
+    pub current_chunk_pos: ChunkPos,
 
     pub pending_keepalive: HashMap<i32, std::time::Instant>, // keep-alive ID -> timestamp when sent
     pub last_latency: Option<Duration>,
@@ -32,6 +33,7 @@ impl Player {
             entity_id: None,
             position: (0.0, 0.0, 0.0),
             rotation: (0.0, 0.0),
+            current_chunk_pos: ChunkPos::new(0, 0),
 
             pending_keepalive: HashMap::new(),
             last_latency: None,
@@ -39,10 +41,7 @@ impl Player {
         }
     }
 
-    pub async fn send_packet(
-        &mut self,
-        packet: ServerPacket,
-    ) -> Result<()> {
+    pub async fn send_packet(&mut self, packet: ServerPacket) -> Result<()> {
         let bytes = packet.to_bytes();
         tracing::info!(packet = ?packet, hex = hex::encode(&bytes), len = bytes.len(), "Sending packet");
         let mut socket = self.socket.lock().await;
@@ -115,6 +114,14 @@ impl Player {
     pub fn get_username(&self) -> Option<String> {
         self.username.clone()
     }
+
+    pub fn get_chunk_pos(&self) -> ChunkPos {
+        self.current_chunk_pos
+    }
+
+    pub fn set_chunk_pos(&mut self, pos: ChunkPos) {
+        self.current_chunk_pos = pos;
+    }
 }
 
 pub async fn get_player_list(players: &PlayerRegistry) -> Vec<(SocketAddr, String, Option<i32>)> {
@@ -146,9 +153,7 @@ pub async fn print_player_list(players: &PlayerRegistry) {
     println!("========================\n");
 }
 
-pub async fn send_player_list_update(
-    players: &PlayerRegistry,
-) -> Result<()> {
+pub async fn send_player_list_update(players: &PlayerRegistry) -> Result<()> {
     let player_list = get_player_list(players).await;
 
     for (addr, username, _) in player_list {

@@ -8,20 +8,20 @@ use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
 
+use crate::chunk_manager::{
+    CHUNK_SIZE_X_U8, CHUNK_SIZE_Y_U8, CHUNK_SIZE_Z_U8, ChunkPos, SharedChunkManager,
+    SharedChunkPos, VIEW_DISTANCE,
+};
 use crate::packets::{ClientPacket, ServerPacket};
 use crate::player::Player;
-use crate::world;
-use crate::{PlayerRegistry, protocol, Result, ServerError};
-
-const CHUNK_SIZE_X: u8 = 16;
-const CHUNK_SIZE_Y: u8 = 128;
-const CHUNK_SIZE_Z: u8 = 16;
+use crate::{PlayerRegistry, Result, ServerError, protocol};
 
 /// Handle an incoming client connection
-#[instrument(skip(socket, players))]
+#[instrument(skip(socket, players, chunk_manager))]
 pub async fn handle_connection(
     socket: TcpStream,
     players: PlayerRegistry,
+    chunk_manager: SharedChunkManager,
 ) -> Result<()> {
     socket.set_nodelay(true)?; // Disable Nagle's algorithm for lower latency
     info!("Connection established");
@@ -108,7 +108,13 @@ pub async fn handle_connection(
 
                     buffer.advance(consumed);
 
-                    handle_packet(packet, player.clone(), players.clone()).await?;
+                    handle_packet(
+                        packet,
+                        player.clone(),
+                        players.clone(),
+                        chunk_manager.clone(),
+                    )
+                    .await?;
                 }
                 Err(nom::Err::Incomplete(_)) => {
                     // Need more data
@@ -139,11 +145,12 @@ pub async fn handle_connection(
 }
 
 /// Handle a parsed client packet
-#[instrument(skip(player, players))]
+#[instrument(skip(player, players, chunk_manager))]
 async fn handle_packet(
     packet: ClientPacket,
     player: Arc<RwLock<Player>>,
     players: PlayerRegistry,
+    chunk_manager: SharedChunkManager,
 ) -> Result<()> {
     match packet {
         ClientPacket::KeepAlive(value) => {
@@ -183,7 +190,7 @@ async fn handle_packet(
                 "Login request received"
             );
             player.write().await.set_username(username.clone());
-            handle_login(player.clone(), players.clone()).await?;
+            handle_login(player.clone(), players.clone(), chunk_manager.clone()).await?;
         }
         ClientPacket::ChatMessage(message) => {
             info!(message = %message, "Chat message received");
@@ -255,18 +262,36 @@ async fn handle_packet(
                 y, stance, z, yaw, pitch, on_ground, "Player position and look update"
             );
 
-            let (old_position, old_rotation) = {
+            let (old_position, old_rotation, old_chunk) = {
                 let player = player.read().await;
-                (player.position, player.rotation)
+                (player.position, player.rotation, player.current_chunk_pos)
             };
 
-    
+            let new_chunk = ChunkPos::from_world_pos(x as i32, z as i32);
+
+            if new_chunk != old_chunk {
+                debug!(
+                    ?old_chunk,
+                    ?new_chunk,
+                    "Player crossed chunk boundary, streaming chunks"
+                );
+                handle_chunk_transition(
+                    player.clone(),
+                    old_chunk,
+                    new_chunk,
+                    chunk_manager.clone(),
+                )
+                .await?;
+            }
+
             // If position changed less then a threshold, we can send a relative move/look instead of teleport for better client interpolation
             const POSITION_THRESHOLD: u8 = 4; // Less than 4 blocks it expected by the client.
             let delta_x = ((x - old_position.0).abs() * 32.0) as u8;
             let delta_y = ((y - old_position.1).abs() * 32.0) as u8;
             let delta_z = ((z - old_position.2).abs() * 32.0) as u8;
-            let small_position_change = delta_x < POSITION_THRESHOLD && delta_y < POSITION_THRESHOLD && delta_z < POSITION_THRESHOLD;
+            let small_position_change = delta_x < POSITION_THRESHOLD
+                && delta_y < POSITION_THRESHOLD
+                && delta_z < POSITION_THRESHOLD;
 
             let delta_yaw = ((yaw - old_rotation.0).abs() * 256.0 / 360.0) as u8;
             let delta_pitch = ((pitch - old_rotation.1).abs() * 256.0 / 360.0) as u8;
@@ -276,6 +301,7 @@ async fn handle_packet(
                 let mut player = player.write().await;
                 player.position = (x, y, z);
                 player.rotation = (yaw, pitch);
+                player.current_chunk_pos = new_chunk;
             }
 
             if small_position_change || rotation_changed {
@@ -412,10 +438,7 @@ async fn handle_packet(
 
 /// Send a packet to the client
 #[instrument(skip(socket, packet))]
-async fn send_packet(
-    socket: Arc<Mutex<OwnedWriteHalf>>,
-    packet: ServerPacket,
-) -> Result<()> {
+async fn send_packet(socket: Arc<Mutex<OwnedWriteHalf>>, packet: ServerPacket) -> Result<()> {
     let bytes = packet.to_bytes();
     socket.lock().await.write_all(&bytes).await?;
     debug!(size = bytes.len(), "Sent packet");
@@ -423,14 +446,21 @@ async fn send_packet(
 }
 
 /// Handle login sequence for a new player
-#[instrument(skip(player, players))]
+#[instrument(skip(player, players, chunk_manager))]
 async fn handle_login(
     player: Arc<RwLock<Player>>,
     players: PlayerRegistry,
+    chunk_manager: SharedChunkManager,
 ) -> Result<()> {
     info!("Starting login sequence");
 
-    let peer_addr = player.read().await.peer_addr;
+    const SPAWN_X: f64 = 0.5;
+    const SPAWN_Y: f64 = 65.0;
+    const SPAWN_Z: f64 = 0.5;
+
+    let spawn_chunk = ChunkPos::from_world_pos(SPAWN_X as i32, SPAWN_Z as i32);
+    let chunk_positions = ChunkPos::chunks_in_radius(spawn_chunk, VIEW_DISTANCE);
+    info!(chunk_count = chunk_positions.len(), view_distance = VIEW_DISTANCE, "Chunks to send for initial view distance");
 
     // Send login response
     player
@@ -455,38 +485,40 @@ async fn handle_login(
         .send_packet(ServerPacket::SpawnPosition { x: 0, y: 64, z: 0 })
         .await?;
 
-    // IMPORTANT: Send chunks BEFORE player position
-    // First send all PreChunk packets so client prepares chunk slots
     let socket = player.read().await.get_socket();
-    info!("Sending pre-chunks");
-    for cz in -1..=1 {
-        for cx in -1..=1 {
-            send_packet(
-                socket.clone(),
-                ServerPacket::PreChunk {
-                    x: cx,
-                    z: cz,
-                    mode: true,
-                },
-            )
-            .await?;
-        }
+
+    // Send PreChunk and MapChunk packets for all chunks in view distance
+    info!("Sending initial chunks");
+    for pos in &chunk_positions {
+        send_packet(
+            socket.clone(),
+            ServerPacket::PreChunk {
+                x: pos.x,
+                z: pos.z,
+                mode: true,
+            },
+        )
+        .await?;
+
+        send_chunk(socket.clone(), pos.x, pos.z, chunk_manager.clone()).await?;
+    }
+    info!(count = chunk_positions.len(), "All initial chunks sent");
+
+    // Create shared chunk position for prefetch task
+    let player_chunk_pos: SharedChunkPos = Arc::new(RwLock::new(spawn_chunk));
+
+    // Update player state
+    {
+        let mut player_write = player.write().await;
+        player_write.position = (SPAWN_X, SPAWN_Y, SPAWN_Z);
+        player_write.current_chunk_pos = spawn_chunk;
     }
 
-    // Now send all MapChunk data
-    info!("Sending map chunks");
-    for cz in -1..=1 {
-        for cx in -1..=1 {
-            send_grass_chunk(socket.clone(), cx, cz).await?;
-        }
-    }
-    info!("All chunks sent");
+    // Start background prefetch task
+    chunk_manager.clone().start_prefetch(player_chunk_pos.clone());
+    info!("Started chunk prefetch task");
 
     // Now send player position after chunks are loaded
-    const SPAWN_X: f64 = 0.5;
-    const SPAWN_Y: f64 = 65.0;
-    const SPAWN_Z: f64 = 0.5;
-
     player
         .write()
         .await
@@ -505,13 +537,19 @@ async fn handle_login(
         let mut player_write = player.write().await;
         let entity_id = rand::random::<i32>();
         player_write.entity_id = Some(entity_id);
-        player_write.position = (SPAWN_X, SPAWN_Y, SPAWN_Z);
-        (entity_id, player_write.get_username().unwrap_or_default(), player_write.peer_addr)
+        (
+            entity_id,
+            player_write.get_username().unwrap_or_default(),
+            player_write.peer_addr,
+        )
     };
 
     // Create entity spawn packets for existing players to show them to the new player
     let player_list = crate::player::get_player_list(&players).await;
-    info!(player_count = player_list.len(), "Existing players to spawn for new player");
+    info!(
+        player_count = player_list.len(),
+        "Existing players to spawn for new player"
+    );
     for (addr, other_username, other_entity_id) in player_list {
         if addr == peer_addr {
             info!("Skipping self");
@@ -523,7 +561,11 @@ async fn handle_login(
             if let Some(other_player) = players_lock.get(&addr) {
                 let p = other_player.read().await;
                 info!(addr = %addr, username = %other_username, entity_id = ?other_entity_id, pos = ?p.position, "Existing player data");
-                (p.position.0 as i32, p.position.1 as i32, p.position.2 as i32)
+                (
+                    p.position.0 as i32,
+                    p.position.1 as i32,
+                    p.position.2 as i32,
+                )
             } else {
                 info!("Player not found in registry");
                 (0, 64, 0)
@@ -556,7 +598,10 @@ async fn handle_login(
     info!(username = %username, entity_id, x = SPAWN_X as i32, y = SPAWN_Y as i32, z = SPAWN_Z as i32, "Broadcasting player spawn");
     let (entity_id, username) = {
         let p = player.read().await;
-        (p.entity_id.unwrap_or(0), p.get_username().unwrap_or_default())
+        (
+            p.entity_id.unwrap_or(0),
+            p.get_username().unwrap_or_default(),
+        )
     };
     player
         .read()
@@ -580,62 +625,86 @@ async fn handle_login(
     Ok(())
 }
 
-/// Send a grass plain chunk to the client (only MapChunk, PreChunk sent separately)
-#[instrument(skip(socket))]
-async fn send_grass_chunk(
+/// Handle chunk transition when player moves to a new chunk
+async fn handle_chunk_transition(
+    player: Arc<RwLock<Player>>,
+    old_chunk: ChunkPos,
+    new_chunk: ChunkPos,
+    chunk_manager: SharedChunkManager,
+) -> Result<()> {
+    let socket = player.read().await.get_socket();
+
+    // Send unload packets for chunks that left view distance
+    let chunks_to_unload = ChunkPos::chunks_to_unload(old_chunk, new_chunk, VIEW_DISTANCE);
+    for pos in &chunks_to_unload {
+        send_packet(
+            socket.clone(),
+            ServerPacket::PreChunk {
+                x: pos.x,
+                z: pos.z,
+                mode: false, // Unload
+            },
+        )
+        .await?;
+    }
+
+    // Send load packets for new chunks
+    let chunks_to_load = ChunkPos::chunks_to_load(old_chunk, new_chunk, VIEW_DISTANCE);
+    for pos in &chunks_to_load {
+        send_packet(
+            socket.clone(),
+            ServerPacket::PreChunk {
+                x: pos.x,
+                z: pos.z,
+                mode: true, // Load
+            },
+        )
+        .await?;
+
+        send_chunk(socket.clone(), pos.x, pos.z, chunk_manager.clone()).await?;
+    }
+
+    info!(
+        loaded = chunks_to_load.len(),
+        unloaded = chunks_to_unload.len(),
+        "Chunk transition complete"
+    );
+
+    Ok(())
+}
+
+/// Send a chunk to the client (only MapChunk, PreChunk sent separately)
+#[instrument(skip(socket, chunk_manager))]
+async fn send_chunk(
     socket: Arc<Mutex<OwnedWriteHalf>>,
     chunk_x: i32,
     chunk_z: i32,
+    chunk_manager: SharedChunkManager,
 ) -> Result<()> {
-    // Calculate expected size per spec: (Size_X+1) * (Size_Y+1) * (Size_Z+1) * 2.5
-    let blocks = (CHUNK_SIZE_X as usize) * (CHUNK_SIZE_Y as usize) * (CHUNK_SIZE_Z as usize);
-    let expected_total = (blocks as f32 * 2.5) as usize;
+    let pos = ChunkPos::new(chunk_x, chunk_z);
+    let compressed_data = chunk_manager.get_compressed_chunk_data(pos).await;
 
-    // Generate terrain data
-    let data = world::generate_perlin_noise_chunk(
-        CHUNK_SIZE_X,
-        CHUNK_SIZE_Y,
-        CHUNK_SIZE_Z,
-        781378172 + chunk_x as u32 * 348712 + chunk_z as u32 * 7987541,
-    );
-
-    debug!(
-        chunk_x,
-        chunk_z,
-        generated_bytes = data.len(),
-        expected_bytes = expected_total,
-        "Generated chunk data"
-    );
-
-    // Compress using zlib format
-    let compressed_data = world::compress_chunk_data(&data)?;
-
-    // Verify zlib format
-    if world::verify_zlib_format(&compressed_data) {
-        debug!(
-            header = format!("{:02X} {:02X}", compressed_data[0], compressed_data[1]),
-            "Valid zlib compression format"
-        );
-    } else {
-        warn!("Invalid compression format - Minecraft may reject this chunk");
+    match compressed_data {
+        Some(data) => {
+            debug!(chunk_x, chunk_z, bytes = data.len(), "Sending chunk data");
+            send_packet(
+                socket.clone(),
+                ServerPacket::MapChunk {
+                    x: chunk_x * 16,
+                    y: 0,
+                    z: chunk_z * 16,
+                    size_x: CHUNK_SIZE_X_U8 - 1,
+                    size_y: CHUNK_SIZE_Y_U8 - 1,
+                    size_z: CHUNK_SIZE_Z_U8 - 1,
+                    compressed_data: data,
+                },
+            )
+            .await?;
+        }
+        None => {
+            warn!(chunk_x, chunk_z, "Failed to get chunk data");
+        }
     }
-
-    // Send chunk data (0x33)
-    // Per spec: X, Y, Z are BLOCK coordinates (not chunk)
-    // Sizes are actual size - 1
-    send_packet(
-        socket.clone(),
-        ServerPacket::MapChunk {
-            x: chunk_x * 16,          // Convert chunk coord to block coord
-            y: 0,                     // Start from bedrock
-            z: chunk_z * 16,          // Convert chunk coord to block coord
-            size_x: CHUNK_SIZE_X - 1, // 15 (actual size 16)
-            size_y: CHUNK_SIZE_Y - 1, // 127 (actual size 128)
-            size_z: CHUNK_SIZE_Z - 1, // 15 (actual size 16)
-            compressed_data,
-        },
-    )
-    .await?;
 
     Ok(())
 }

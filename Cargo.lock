@@ -78,6 +78,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "flats"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4938609ab1f39f870a9ed5726979d9dcc48fe095cb6ea136ed0500c8c0566b54"
+dependencies = [
+ "serde",
+ "serde_derive",
+ "serde_json",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -201,6 +212,7 @@ name = "mincraft_server"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "flats",
  "hex",
  "noise",
  "nom",

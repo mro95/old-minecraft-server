@@ -1,3 +1,4 @@
+mod chunk_manager;
 mod errors;
 mod packet_ids;
 mod packets;
@@ -6,7 +7,8 @@ mod protocol;
 mod server;
 mod world;
 
-pub use errors::{ServerError, Result};
+pub use chunk_manager::{ChunkManager, SharedChunkManager};
+pub use errors::{Result, ServerError};
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -20,7 +22,6 @@ type PlayerRegistry = Arc<RwLock<HashMap<std::net::SocketAddr, Arc<RwLock<Player
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> crate::Result<()> {
-    // Initialize tracing subscriber
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -34,13 +35,18 @@ async fn main() -> crate::Result<()> {
 
     let players: PlayerRegistry = Arc::new(RwLock::new(HashMap::new()));
 
+    let chunk_manager: SharedChunkManager = Arc::new(ChunkManager::new("world"));
+    chunk_manager.clone().start_auto_save().await;
+    info!("Auto-save task started (every 60 seconds)");
+
     loop {
         let (socket, addr) = listener.accept().await?;
         info!(address = %addr, "New connection");
 
         let players = players.clone();
+        let chunk_manager = chunk_manager.clone();
         tokio::spawn(async move {
-            if let Err(e) = server::handle_connection(socket, players).await {
+            if let Err(e) = server::handle_connection(socket, players, chunk_manager).await {
                 error!(error = %e, "Connection error");
             }
         });
